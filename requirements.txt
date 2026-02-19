@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+google-genai
+audioop-lts
+python-multipart
+websockets
