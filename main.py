@@ -123,14 +123,31 @@ async def websocket_endpoint(ws: WebSocket):
                 await gemini_session.send(input=types.Part.from_text(greeting))
                 log.info(f"Sent initial greeting: {greeting}")
 
-                async def send_follow_up():
+                async def send_follow_ups():
                     await asyncio.sleep(5)
                     if ws.client_state == "CONNECTED":
-                        follow_up = "I didn't hear a response. Are you still there? Please say 'yes' or 'no'."
-                        await gemini_session.send(input=types.Part.from_text(follow_up))
-                        log.info(f"Sent follow-up: {follow_up}")
+                        msg1 = "I didn't hear a response yet. Are you still there? Please say 'yes' or 'no'."
+                        await gemini_session.send(input=types.Part.from_text(msg1))
+                        log.info(f"Sent follow-up 1: {msg1}")
+                    await asyncio.sleep(6)
+                    if ws.client_state == "CONNECTED":
+                        msg2 = "Let's get started. Are you interested in solar panels for your home?"
+                        await gemini_session.send(input=types.Part.from_text(msg2))
+                        log.info(f"Sent follow-up 2: {msg2}")
 
-                asyncio.create_task(send_follow_up())
+                asyncio.create_task(send_follow_ups())
+
+                async def keep_alive():
+                    while ws.client_state == "CONNECTED":
+                        await asyncio.sleep(5)
+                        await ws.send_text(json.dumps({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {"payload": base64.b64encode(b"").decode("utf-8")},
+                        }))
+                        log.debug("Sent keep-alive ping to Twilio")
+
+                asyncio.create_task(keep_alive())
 
                 async def twilio_to_gemini():
                     log.info("Starting twilio_to_gemini loop")
