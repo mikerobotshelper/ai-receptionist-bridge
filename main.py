@@ -123,10 +123,17 @@ async def websocket_endpoint(ws: WebSocket):
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
                 log.info("Gemini Live session connected")
 
-                # Send initial greeting immediately
-                greeting = "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
-                await gemini_session.send(input=types.Part.from_text(greeting))
-                log.info(f"Sent initial greeting: {greeting}")
+               # Force continuous speech for testing
+await gemini_session.send(input=types.Part.from_text(
+    "Hello! This is Ava with Sunlight Solar. I'm here to help you with your solar needs. "
+    "To get started, are you the homeowner?"
+))
+
+# Optional: send follow-up if no response (for testing only)
+await asyncio.sleep(5)
+await gemini_session.send(input=types.Part.from_text(
+    "I didn't hear anything. Are you still there? Can you say 'yes' or 'no'?"
+))
 
                 async def twilio_to_gemini():
                     log.info("Starting twilio_to_gemini loop")
