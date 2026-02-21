@@ -11,24 +11,20 @@ from fastapi.responses import HTMLResponse
 from google import genai
 from google.genai import types
 
-# Audio Compatibility for Python 3.13+
 try:
     import audioop
 except ImportError:
     import audioop_lts as audioop
 
-# Logging Configuration
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("receptionist")
 
 app = FastAPI(root_path="/")
 
-# Print registered routes at startup
 print("Routes registered:")
 for route in app.routes:
     print(f"  {route.path} {route.methods}")
 
-# Environment Variables
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 N8N_CALL_START_URL = os.environ.get("N8N_CALL_START_URL")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
@@ -113,27 +109,19 @@ async def websocket_endpoint(ws: WebSocket):
                 "response_modalities": ["AUDIO"],
                 "system_instruction": session.get(
                     "systemPrompt",
-                    "You are a friendly receptionist named Ava from Sunlight Solar. Always speak clearly and start by greeting the caller."
+                    "You are Ava, a friendly receptionist for Sunlight Solar. Greet the caller and ask if they are the homeowner."
                 ),
                 "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
-                # Temporarily disabled tools to prevent startup issues
-                # "tools": [_get_tools_config()],
+                # "tools": [_get_tools_config()],  # commented to avoid startup issues
             }
 
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
                 log.info("Gemini Live session connected")
 
-               # Force continuous speech for testing
-await gemini_session.send(input=types.Part.from_text(
-    "Hello! This is Ava with Sunlight Solar. I'm here to help you with your solar needs. "
-    "To get started, are you the homeowner?"
-))
-
-# Optional: send follow-up if no response (for testing only)
-await asyncio.sleep(5)
-await gemini_session.send(input=types.Part.from_text(
-    "I didn't hear anything. Are you still there? Can you say 'yes' or 'no'?"
-))
+                # Send initial greeting
+                greeting = "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
+                await gemini_session.send(input=types.Part.from_text(greeting))
+                log.info(f"Sent initial greeting: {greeting}")
 
                 async def twilio_to_gemini():
                     log.info("Starting twilio_to_gemini loop")
@@ -141,13 +129,13 @@ await gemini_session.send(input=types.Part.from_text(
                         async for message in _websocket_stream(ws):
                             log.debug(f"Twilio event: {message.get('event')}")
                             if message.get("event") == "media":
-                                log.info("Received media packet from caller")
+                                log.info("Received media from caller")
                                 payload = base64.b64decode(message["media"]["payload"])
                                 pcm_8k = audioop.ulaw2lin(payload, 2)
                                 pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
                                 await gemini_session.send(input=types.Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
                             elif message.get("event") == "stop":
-                                log.info("Twilio sent stop event")
+                                log.info("Twilio stop event")
                                 break
                     except Exception as e:
                         log.error(f"twilio_to_gemini error: {e}")
@@ -156,9 +144,9 @@ await gemini_session.send(input=types.Part.from_text(
                     log.info("Starting gemini_to_twilio loop")
                     try:
                         async for response in gemini_session.receive():
-                            log.debug("Received chunk from Gemini")
+                            log.debug("Gemini chunk received")
                             if response.data:
-                                log.info("Gemini sent audio data - forwarding to Twilio")
+                                log.info(f"Gemini audio data received ({len(response.data)} bytes)")
                                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
                                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                                 await ws.send_text(json.dumps({
@@ -166,8 +154,9 @@ await gemini_session.send(input=types.Part.from_text(
                                     "streamSid": stream_sid,
                                     "media": {"payload": base64.b64encode(mulaw).decode("utf-8")},
                                 }))
+                                log.info("Forwarded audio to Twilio")
                             if response.tool_call:
-                                log.info("Gemini requested tool call - handling")
+                                log.info("Gemini tool call")
                                 for fc in response.tool_call.function_calls:
                                     tool_result = await handle_booking(fc.args, call_sid)
                                     await gemini_session.send(input=types.LiveClientToolResponse(
@@ -183,15 +172,10 @@ await gemini_session.send(input=types.Part.from_text(
     except WebSocketDisconnect:
         log.info(f"WebSocket disconnected | sid={call_sid}")
     except Exception as e:
-        log.error(f"WebSocket general error: {e}")
+        log.error(f"WebSocket error: {e}")
     finally:
         if call_sid:
-            log.info("Triggering post-call n8n")
             await trigger_post_call(call_sid)
-
-# ──────────────────────────────────────────────
-# Helper Functions
-# ──────────────────────────────────────────────
 
 async def lookup_client(from_number, to_number, sid):
     try:
@@ -201,8 +185,8 @@ async def lookup_client(from_number, to_number, sid):
                 "calledNumber": to_number,
                 "callSid": sid
             })
-            log.info(f"n8n response status: {resp.status_code}")
-            log.debug(f"n8n response body: {resp.text}")
+            log.info(f"n8n status: {resp.status_code}")
+            log.debug(f"n8n body: {resp.text}")
             return resp.json() if resp.status_code == 200 else None
     except Exception as e:
         log.error(f"lookup_client error: {e}")
