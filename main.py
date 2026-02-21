@@ -11,37 +11,33 @@ from fastapi.responses import HTMLResponse
 from google import genai
 from google.genai import types
 
-# --- Audio Compatibility for Python 3.13+ ---
+# Audio Compatibility for Python 3.13+
 try:
     import audioop
 except ImportError:
     import audioop_lts as audioop
 
-# --- Logging Configuration ---
+# Logging Configuration
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("receptionist")
 
-# Explicitly set root_path to "/" (helps on some hosting platforms like Railway)
 app = FastAPI(root_path="/")
 
-# Print all registered routes at startup (very helpful for debugging)
+# Print registered routes at startup
 print("Routes registered:")
 for route in app.routes:
     print(f"  {route.path} {route.methods}")
 
-# --- Environment Variables ---
+# Environment Variables
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 N8N_CALL_START_URL = os.environ.get("N8N_CALL_START_URL")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 
-# Model: Using the 2026 stable Gemini Live model
 GEMINI_MODEL = "gemini-2.0-flash-exp"
 
-# --- Gemini Client ---
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Store session data in memory (CallSid as key)
 session_store: dict[str, dict] = {}
 
 @app.get("/health")
@@ -50,10 +46,9 @@ async def health():
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    """Step 1: Twilio calls this endpoint."""
-    log.info("HIT /incoming-call endpoint!")  # ← Debug: confirms endpoint is reached
+    log.info("HIT /incoming-call endpoint!")
     form = await request.form()
-    log.debug(f"Form data received: {form}")   # ← Debug: shows what Twilio sent
+    log.debug(f"Form data received: {form}")
 
     caller_phone = form.get("From", "")
     called_number = form.get("To", "")
@@ -61,7 +56,6 @@ async def incoming_call(request: Request):
 
     log.info(f"Incoming call | from={caller_phone} to={called_number} sid={call_sid}")
 
-    # Fetch configuration (Flow A)
     client_config = await lookup_client(caller_phone, called_number, call_sid)
 
     if not client_config:
@@ -71,7 +65,6 @@ async def incoming_call(request: Request):
             media_type="text/xml",
         )
 
-    # Store session details for use during the call
     session_store[call_sid] = {
         "callerPhone": caller_phone,
         "calledNumber": called_number,
@@ -83,7 +76,6 @@ async def incoming_call(request: Request):
         "appointmentBooked": False
     }
 
-    # Use environment variable or request host for WebSocket URL
     ws_host = os.environ.get("WEBSOCKET_HOST", request.headers.get("host", "localhost"))
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -100,10 +92,7 @@ async def websocket_endpoint(ws: WebSocket):
     log.info("WebSocket connection attempt received")
     await ws.accept()
     log.info("WebSocket accepted")
-    # ... rest of your code
-async def websocket_endpoint(ws: WebSocket):
-    """Step 2: The WebSocket bridge between Twilio and Gemini."""
-    await ws.accept()
+
     call_sid = None
     stream_sid = None
 
@@ -120,32 +109,44 @@ async def websocket_endpoint(ws: WebSocket):
 
             config = {
                 "response_modalities": ["AUDIO"],
-                "system_instruction": session.get("systemPrompt"),
+                "system_instruction": session.get("systemPrompt", "You are a helpful AI receptionist."),
                 "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
                 "tools": [_get_tools_config()],
             }
 
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
                 # Force initial greeting
-await gemini_session.send(input=types.Part.from_text("Hi, this is Ava with Sunlight Solar. To get started are you the home owner?"))
+                await gemini_session.send(
+                    input=types.Part.from_text(
+                        "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
+                    )
+                )
+                log.info("Sent initial greeting to Gemini")
 
                 async def twilio_to_gemini():
+                    log.info("Starting twilio_to_gemini loop")
                     try:
                         async for message in _websocket_stream(ws):
+                            log.info(f"Received from Twilio: {message.get('event')}")
                             if message.get("event") == "media":
+                                log.info("Received media packet from Twilio")
                                 payload = base64.b64decode(message["media"]["payload"])
                                 pcm_8k = audioop.ulaw2lin(payload, 2)
                                 pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
                                 await gemini_session.send(input=types.Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
                             elif message.get("event") == "stop":
+                                log.info("Twilio sent stop event")
                                 break
                     except Exception as e:
-                        log.error(f"Twilio->Gemini Error: {e}")
+                        log.error(f"Twilio->Gemini error: {e}")
 
                 async def gemini_to_twilio():
+                    log.info("Starting gemini_to_twilio loop")
                     try:
                         async for response in gemini_session.receive():
+                            log.info("Received response from Gemini")
                             if response.data:
+                                log.info("Gemini sent audio data")
                                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
                                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                                 await ws.send_text(json.dumps({
@@ -153,8 +154,8 @@ await gemini_session.send(input=types.Part.from_text("Hi, this is Ava with Sunli
                                     "streamSid": stream_sid,
                                     "media": {"payload": base64.b64encode(mulaw).decode("utf-8")},
                                 }))
-
                             if response.tool_call:
+                                log.info("Gemini requested tool call")
                                 for fc in response.tool_call.function_calls:
                                     tool_result = await handle_booking(fc.args, call_sid)
                                     await gemini_session.send(input=types.LiveClientToolResponse(
@@ -163,7 +164,7 @@ await gemini_session.send(input=types.Part.from_text("Hi, this is Ava with Sunli
                                         )]
                                     ))
                     except Exception as e:
-                        log.error(f"Gemini->Twilio Error: {e}")
+                        log.error(f"Gemini->Twilio error: {e}")
 
                 await asyncio.gather(twilio_to_gemini(), gemini_to_twilio())
 
@@ -173,10 +174,11 @@ await gemini_session.send(input=types.Part.from_text("Hi, this is Ava with Sunli
         if call_sid:
             await trigger_post_call(call_sid)
 
-# --- Helper Functions ---
+# ──────────────────────────────────────────────
+# Helper Functions (unchanged)
+# ──────────────────────────────────────────────
 
 async def lookup_client(from_number, to_number, sid):
-    """Hits n8n Flow A for client business data."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(N8N_CALL_START_URL, json={
@@ -184,12 +186,14 @@ async def lookup_client(from_number, to_number, sid):
                 "calledNumber": to_number,
                 "callSid": sid
             })
+            log.info(f"n8n response status: {resp.status_code}")
+            log.debug(f"n8n response body: {resp.text}")
             return resp.json() if resp.status_code == 200 else None
-    except Exception:
+    except Exception as e:
+        log.error(f"lookup_client error: {e}")
         return None
 
 async def handle_booking(args, call_sid):
-    """Hits n8n Flow B to book an appointment."""
     session = session_store.get(call_sid, {})
     payload = {**args, "callSid": call_sid, "calendarId": session.get("calendarId")}
 
@@ -204,7 +208,6 @@ async def handle_booking(args, call_sid):
         return {"success": False, "error": str(e)}
 
 async def trigger_post_call(call_sid):
-    """Hits n8n Flow C for call summary and email."""
     session = session_store.pop(call_sid, {})
     try:
         async with httpx.AsyncClient(timeout=10) as client:
