@@ -27,9 +27,13 @@ N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 WEBSOCKET_HOST = os.environ.get("WEBSOCKET_HOST", "")
 
-GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
+# This model supports true bidirectional native audio
+GEMINI_MODEL = "gemini-2.0-flash-live-001"
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options={"api_version": "v1alpha"},
+)
 
 session_store: dict = {}
 
@@ -154,14 +158,16 @@ async def websocket_endpoint(ws: WebSocket):
             model=GEMINI_MODEL, config=gemini_config
         ) as gemini_session:
 
-            # Send initial greeting prompt to Gemini
+            log.info(f"Gemini session open | sid={call_sid}")
+
+            # Send initial greeting — Gemini speaks first
             greeting = (
                 "Greet the caller warmly as the receptionist for "
                 + company_name
                 + ". Be friendly and ask how you can help."
             )
             await gemini_session.send(input=greeting, end_of_turn=True)
-            log.info("Greeting sent to Gemini")
+            log.info(f"Greeting sent | sid={call_sid}")
 
             # Run both audio directions simultaneously
             await asyncio.gather(
@@ -175,7 +181,7 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             await trigger_post_call(call_sid)
-        log.info("connection closed")
+        log.info(f"Connection closed | sid={call_sid}")
 
 
 # ──────────────────────────────────────────────
@@ -189,13 +195,13 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
             event = msg.get("event")
 
             if event == "media":
-                # Decode base64 payload from Twilio
+                # Decode base64 audio from Twilio (mulaw 8kHz)
                 audio_bytes = base64.b64decode(msg["media"]["payload"])
 
-                # Twilio sends mulaw 8kHz — convert to linear PCM
+                # Convert mulaw → linear PCM 16-bit
                 pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
 
-                # Upsample from 8kHz to 16kHz for Gemini
+                # Upsample 8kHz → 16kHz for Gemini
                 pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
 
                 # Stream caller audio to Gemini
@@ -250,7 +256,7 @@ async def _gemini_to_twilio(
                 # Gemini outputs PCM 24kHz — downsample to 8kHz
                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
 
-                # Convert linear PCM to mulaw for Twilio
+                # Convert linear PCM → mulaw for Twilio
                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                 payload = base64.b64encode(mulaw).decode("utf-8")
 
