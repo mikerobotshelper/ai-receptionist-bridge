@@ -29,11 +29,9 @@ N8N_POST_CALL_URL        = os.environ.get("N8N_POST_CALL_URL", "")
 # ── FIXED: correct model string for the current SDK version ──────────────────
 # "models/gemini-2.0-flash-live-001" only works with v1alpha API
 # The SDK default is v1beta, so we use this model string instead:
-GEMINI_MODEL = "gemini-2.0-flash-live-001"
+GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options={"api_version": "v1alpha"},   # Live API requires v1alpha
+gemini_client = genai.Client(api_key=GEMINI_API_KEY),   # Live API requires v1alpha
 )
 
 session_store: dict[str, dict] = {}
