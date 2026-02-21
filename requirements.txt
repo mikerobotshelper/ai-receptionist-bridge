@@ -1,7 +1,5 @@
 fastapi
 uvicorn
 httpx
-google-genai
-audioop-lts
+google-generativeai
 python-multipart
-websockets
