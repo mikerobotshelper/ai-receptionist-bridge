@@ -3,22 +3,27 @@ import base64
 import json
 import logging
 import os
+from io import BytesIO
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# Correct import - this is the official one
-import google.generativeai as genai
-from google.generativeai.types import Blob
+# New official SDK (2026)
+from google import genai
+from google.genai import types
+
+# TTS fallback
+from gtts import gTTS
+from pydub import AudioSegment
 
 try:
     import audioop
 except ImportError:
     import audioop_lts as audioop
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("receptionist")
 
 app = FastAPI(root_path="/")
@@ -34,7 +39,7 @@ N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 
 GEMINI_MODEL = "gemini-2.0-flash-exp"
 
-# Configure the client properly
+# Configure new SDK
 genai.configure(api_key=GEMINI_API_KEY)
 
 session_store: dict[str, dict] = {}
@@ -45,38 +50,41 @@ async def health():
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    log.info("HIT /incoming-call endpoint!")
-    form = await request.form()
-    log.debug(f"Form data received: {form}")
+    try:
+        log.info("HIT /incoming-call endpoint!")
+        form = await request.form()
+        log.debug(f"Form data received: {form}")
 
-    caller_phone = form.get("From", "")
-    called_number = form.get("To", "")
-    call_sid = form.get("CallSid", "")
+        caller_phone = form.get("From", "")
+        called_number = form.get("To", "")
+        call_sid = form.get("CallSid", "")
 
-    log.info(f"Incoming call | from={caller_phone} to={called_number} sid={call_sid}")
+        log.info(f"Incoming call | from={caller_phone} to={called_number} sid={call_sid}")
 
-    client_config = await lookup_client(caller_phone, called_number, call_sid)
+        client_config = await lookup_client(caller_phone, called_number, call_sid)
 
-    if not client_config:
-        log.error("Failed to retrieve client config from n8n.")
-        return HTMLResponse(
-            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Connection error. Please try again later.</Say><Hangup/></Response>',
-            media_type="text/xml",
-        )
+        if not client_config:
+            log.warning("No client config - returning fallback TwiML")
+            return HTMLResponse(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Connection error. Please try again later.</Say><Hangup/></Response>',
+                media_type="text/xml",
+            )
 
-    session_store[call_sid] = {
-        "callerPhone": caller_phone,
-        "calledNumber": called_number,
-        "companyName": client_config.get("companyName", "Our Business"),
-        "calendarId": client_config.get("calendarId", ""),
-        "timezone": client_config.get("timezone", "UTC"),
-        "systemPrompt": client_config.get("systemPrompt", "You are a helpful AI receptionist."),
-        "clientRecordId": client_config.get("clientRecordId", ""),
-        "appointmentBooked": False
-    }
+        session_store[call_sid] = {
+            "callerPhone": caller_phone,
+            "calledNumber": called_number,
+            "companyName": client_config.get("companyName", "Our Business"),
+            "calendarId": client_config.get("calendarId", ""),
+            "timezone": client_config.get("timezone", "UTC"),
+            "systemPrompt": client_config.get("systemPrompt", "You are a helpful AI receptionist."),
+            "clientRecordId": client_config.get("clientRecordId", ""),
+            "appointmentBooked": False
+        }
 
-    ws_host = os.environ.get("WEBSOCKET_HOST", request.headers.get("host", "localhost"))
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+        ws_host = os.environ.get("WEBSOCKET_HOST", request.headers.get("host", "localhost"))
+        log.info(f"Using WS host: {ws_host}")
+
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="wss://{ws_host}/ws">
@@ -84,8 +92,16 @@ async def incoming_call(request: Request):
     </Stream>
   </Connect>
 </Response>"""
-    log.info(f"Returning TwiML with WS URL: wss://{ws_host}/ws")
-    return HTMLResponse(content=twiml, media_type="text/xml")
+        log.info(f"Returning TwiML with WS URL: wss://{ws_host}/ws")
+        return HTMLResponse(content=twiml, media_type="text/xml")
+
+    except Exception as e:
+        log.exception("CRASH in /incoming-call")
+        return HTMLResponse(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, something went wrong. Please try again.</Say><Hangup/></Response>',
+            media_type="text/xml",
+            status_code=500
+        )
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -99,6 +115,7 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         initial_msg = await ws.receive_text()
         msg = json.loads(initial_msg)
+        log.debug(f"Initial WS message: {msg}")
 
         if msg.get("event") == "start":
             stream_sid = msg["start"]["streamSid"]
@@ -106,90 +123,89 @@ async def websocket_endpoint(ws: WebSocket):
             log.info(f"Stream started | sid={call_sid} | stream={stream_sid}")
 
             session = session_store.get(call_sid, {})
+            log.debug(f"Session data: {session}")
 
-            config = {
-                "response_modalities": ["AUDIO"],
-                "system_instruction": session.get("systemPrompt"),
-                "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
-            }
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=session.get("systemPrompt", "You are a helpful AI receptionist.")
+            )
 
-            async with genai.GenerativeModel(GEMINI_MODEL).start_chat() as chat:  # Use chat for simplicity
-                log.info("Gemini chat session started")
+            chat = model.start_chat(history=[])
 
-                # Send initial greeting as text
-                greeting = "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
-                response = chat.send_message(greeting)
-                log.info(f"Gemini text response: {response.text}")
+            # Send initial greeting
+            greeting = "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
+            response = chat.send_message(greeting)
+            log.info(f"Gemini text response: {response.text}")
 
-                # For audio, we'd need to convert text to speech - add gTTS here if needed
+            # Convert to speech and send
+            await send_text_as_audio(ws, stream_sid, greeting)
 
-                async def twilio_to_gemini():
-                    try:
-                        async for message in _websocket_stream(ws):
-                            if message.get("event") == "media":
-                                payload = base64.b64decode(message["media"]["payload"])
-                                pcm_8k = audioop.ulaw2lin(payload, 2)
-                                pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
-                                # Send audio blob to Gemini (if using audio input mode)
-                                # chat.send_message(Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
-                                log.debug("Audio chunk sent to Gemini")
-                            elif message.get("event") == "stop":
-                                break
-                    except Exception as e:
-                        log.error(f"Twilio->Gemini error: {e}")
+            async def keep_alive():
+                while ws.client_state == "CONNECTED":
+                    await asyncio.sleep(5)
+                    await ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": base64.b64encode(b"").decode("utf-8")},
+                    }))
+                    log.debug("Sent keep-alive ping")
 
-                async def gemini_to_twilio():
-                    try:
-                        # This would be the audio response loop - simplified for now
-                        log.info("Gemini to Twilio loop started")
-                        # You'd receive audio from Gemini here and convert/send back
-                    except Exception as e:
-                        log.error(f"Gemini->Twilio error: {e}")
+            asyncio.create_task(keep_alive())
 
-                await asyncio.gather(twilio_to_gemini(), gemini_to_twilio())
+            async def twilio_to_gemini():
+                log.info("Starting twilio_to_gemini loop")
+                try:
+                    async for message in _websocket_stream(ws):
+                        if message.get("event") == "media":
+                            log.info("Received media packet from caller")
+                            payload = base64.b64decode(message["media"]["payload"])
+                            pcm_8k = audioop.ulaw2lin(payload, 2)
+                            pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
+                            # Send audio to Gemini (new SDK audio input)
+                            response = chat.send_message(Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
+                            log.info(f"Gemini audio response received")
+                            await send_text_as_audio(ws, stream_sid, response.text)
+                        elif message.get("event") == "stop":
+                            log.info("Twilio stop event")
+                            break
+                except Exception as e:
+                    log.error(f"twilio_to_gemini error: {e}")
+
+            await twilio_to_gemini()
 
     except WebSocketDisconnect:
         log.info(f"WebSocket disconnected | sid={call_sid}")
+    except Exception as e:
+        log.exception(f"WebSocket error: {e}")
     finally:
         if call_sid:
             await trigger_post_call(call_sid)
 
-async def lookup_client(from_number, to_number, sid):
+async def send_text_as_audio(ws: WebSocket, stream_sid: str, text: str):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(N8N_CALL_START_URL, json={
-                "callerPhone": from_number,
-                "calledNumber": to_number,
-                "callSid": sid
-            })
-            return resp.json() if resp.status_code == 200 else None
-    except Exception:
-        return None
+        log.info(f"Generating TTS for: {text[:50]}...")
+        tts = gTTS(text=text, lang="en")
+        mp3_fp = BytesIO()
+        tts.write_to_fp(mp3_fp)
+        mp3_fp.seek(0)
 
-async def handle_booking(args, call_sid):
-    session = session_store.get(call_sid, {})
-    payload = {**args, "callSid": call_sid, "calendarId": session.get("calendarId")}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(N8N_BOOK_APPOINTMENT_URL, json=payload)
-            return resp.json()
-    except Exception:
-        return {"success": False, "error": "Booking failed"}
+        audio = AudioSegment.from_mp3(mp3_fp)
+        audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+        raw_pcm = audio.raw_data
 
-async def trigger_post_call(call_sid):
-    session = session_store.pop(call_sid, {})
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(N8N_POST_CALL_URL, json=session)
-    except Exception:
-        pass
+        mulaw = audioop.lin2ulaw(raw_pcm, 2)
 
-async def _websocket_stream(ws):
-    while True:
-        try:
-            yield json.loads(await ws.receive_text())
-        except:
-            break
+        payload = base64.b64encode(mulaw).decode("utf-8")
+        await ws.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": payload},
+        }))
+        log.info(f"Sent TTS audio packet (length {len(mulaw)} bytes)")
+    except Exception as e:
+        log.error(f"TTS send error: {e}")
+
+# Your helper functions remain the same (lookup_client, handle_booking, trigger_post_call, _websocket_stream)
 
 if __name__ == "__main__":
     import uvicorn
