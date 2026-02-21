@@ -34,9 +34,18 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 session_store: dict = {}
 
 # Silence detection tuning
-SILENCE_THRESHOLD = 300    # RMS below this = silence
-SILENCE_CHUNKS_NEEDED = 25  # ~500ms of silence triggers end_of_turn
-SPEECH_THRESHOLD = 400     # RMS above this = speech detected
+SILENCE_THRESHOLD = 50
+SILENCE_CHUNKS_NEEDED = 25
+SPEECH_THRESHOLD = 80
+```
+
+That's it — just those 3 numbers. Commit the change, wait 2 minutes for Railway, then call again.
+
+After calling you should now see in the logs:
+```
+Speech detected | rms=100 | sid=CA...
+Silence detected — sending end_of_turn
+Audio chunk received | 1920 bytes   ← Gemini responds!
 
 
 # ──────────────────────────────────────────────
