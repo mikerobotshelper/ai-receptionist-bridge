@@ -126,6 +126,8 @@ async def websocket_endpoint(ws: WebSocket):
             }
 
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
+                # Force initial greeting
+await gemini_session.send(input=types.Part.from_text("Hi, this is Ava with Sunlight Solar. To get started are you the home owner?"))
 
                 async def twilio_to_gemini():
                     try:
