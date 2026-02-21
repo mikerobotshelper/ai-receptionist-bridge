@@ -27,13 +27,10 @@ N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 WEBSOCKET_HOST = os.environ.get("WEBSOCKET_HOST", "")
 
-# This model supports true bidirectional native audio
-GEMINI_MODEL = "gemini-2.0-flash-live-001"
+# Confirmed available on your Google AI Studio account
+GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY,
-    http_options={"api_version": "v1alpha"},
-)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 session_store: dict = {}
 
@@ -141,6 +138,7 @@ async def websocket_endpoint(ws: WebSocket):
         system_prompt = data.get("systemPrompt", "You are a helpful receptionist.")
         company_name = data.get("companyName", "our business")
 
+        # AUDIO only — suppresses text/thought parts that cause the warning
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_prompt,
@@ -160,7 +158,7 @@ async def websocket_endpoint(ws: WebSocket):
 
             log.info(f"Gemini session open | sid={call_sid}")
 
-            # Send initial greeting — Gemini speaks first
+            # Send greeting — Gemini speaks first
             greeting = (
                 "Greet the caller warmly as the receptionist for "
                 + company_name
@@ -226,6 +224,8 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
 
 # ──────────────────────────────────────────────
 # DIRECTION 2 — Agent audio: Gemini → Twilio
+# Only sends response.data (raw audio bytes).
+# Ignores text/thought parts that trigger the warning.
 # ──────────────────────────────────────────────
 async def _gemini_to_twilio(
     gemini_session, ws: WebSocket, stream_sid: str, call_sid: str, session_data: dict
@@ -251,12 +251,14 @@ async def _gemini_to_twilio(
                             )
                         )
 
-            # Send Gemini audio back to Twilio
-            if response.data:
-                # Gemini outputs PCM 24kHz — downsample to 8kHz
+            # Only process raw audio bytes — skip text/thought parts entirely
+            if response.data and isinstance(response.data, bytes) and len(response.data) > 0:
+                log.info(f"Audio chunk received | {len(response.data)} bytes | sid={call_sid}")
+
+                # Gemini outputs PCM 24kHz — downsample to 8kHz for Twilio
                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
 
-                # Convert linear PCM → mulaw for Twilio
+                # Convert linear PCM → mulaw
                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                 payload = base64.b64encode(mulaw).decode("utf-8")
 
