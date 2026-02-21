@@ -2,5 +2,5 @@ fastapi
 uvicorn
 httpx
 google-generativeai
-gtts==2.5.3
-pydub==0.25.1
+gtts
+pydub
