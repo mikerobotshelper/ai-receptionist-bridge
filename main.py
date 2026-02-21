@@ -14,4 +14,4 @@ for route in app.routes:
 
 Save → Commit/push to GitHub (if using Git) or re-upload files in Railway.
 Railway > Deployments > Trigger Redeploy (or wait for auto-deploy).
-Wait 1-2 minutes → Check Railway Logs for the new "Routes registered:" lines (should show /incoming-call ['POST']).
+Wait 1-2 minutes - Check Railway Logs for the new "Routes registered:" lines (should show /incoming-call ['POST']).
