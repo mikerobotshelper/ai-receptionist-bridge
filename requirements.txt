@@ -10,3 +10,5 @@ httpx
 google-generativeai
 gtts
 pydub  # for audio conversion if needed
+gtts
+pydub
