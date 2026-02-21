@@ -26,13 +26,20 @@ N8N_CALL_START_URL       = os.environ.get("N8N_CALL_START_URL", "")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL", "")
 N8N_POST_CALL_URL        = os.environ.get("N8N_POST_CALL_URL", "")
 
-GEMINI_MODEL  = "models/gemini-2.0-flash-live-001"
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+# ── FIXED: correct model string for the current SDK version ──────────────────
+# "models/gemini-2.0-flash-live-001" only works with v1alpha API
+# The SDK default is v1beta, so we use this model string instead:
+GEMINI_MODEL = "gemini-2.0-flash-live-001"
+
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options={"api_version": "v1alpha"},   # Live API requires v1alpha
+)
 
 session_store: dict[str, dict] = {}
 
 
-# ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+# ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -114,13 +121,11 @@ async def websocket_endpoint(ws: WebSocket):
     stream_sid: Optional[str] = None
 
     try:
-        # ── KEY FIX: Twilio sends "connected" first, THEN "start" ────────────
-        # The old code only read ONE message and assumed it was "start".
-        # We now loop until we actually see the "start" event.
+        # Twilio sends "connected" first, then "start" — loop until we see "start"
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
-            log.info(f"WS pre-start event: {msg.get('event')}")
+            log.info(f"WS event: {msg.get('event')}")
 
             if msg.get("event") == "start":
                 stream_sid = msg["start"]["streamSid"]
@@ -132,19 +137,17 @@ async def websocket_endpoint(ws: WebSocket):
                 break
 
             elif msg.get("event") == "stop":
-                log.info("Received stop before start — closing")
+                log.info("Stop before start — closing")
                 return
 
-        # Guard: make sure we have a valid session
         if not call_sid or call_sid not in session_store:
-            log.error(f"No session for sid={call_sid} — closing WebSocket")
+            log.error(f"No session for sid={call_sid}")
             return
 
         session       = session_store[call_sid]
         system_prompt = session.get("systemPrompt", "You are a helpful receptionist.")
         company_name  = session.get("companyName", "our business")
 
-        # ── Open Gemini Live session ──────────────────────────────────────────
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_prompt,
@@ -162,17 +165,16 @@ async def websocket_endpoint(ws: WebSocket):
             model=GEMINI_MODEL, config=gemini_config
         ) as gemini_session:
 
-            # Prompt Gemini to speak first so the caller hears a greeting
+            # Prompt Gemini to speak first
             await gemini_session.send(
                 input=types.Part.from_text(
                     f"Greet the caller warmly as a receptionist for {company_name}. "
-                    f"Introduce yourself by the name in your system prompt and ask how you can help."
+                    f"Use the name and personality from your system prompt."
                 )
             )
-            log.info("Sent greeting prompt to Gemini")
+            log.info("Sent greeting to Gemini")
 
             async def twilio_to_gemini():
-                """Twilio μ-law 8kHz → PCM 16kHz → Gemini"""
                 async for twilio_msg in _twilio_stream(ws):
                     event = twilio_msg.get("event")
                     if event == "media":
@@ -190,9 +192,7 @@ async def websocket_endpoint(ws: WebSocket):
                         break
 
             async def gemini_to_twilio():
-                """Gemini PCM 24kHz → μ-law 8kHz → Twilio"""
                 async for response in gemini_session.receive():
-
                     if response.data:
                         pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
                         mulaw     = audioop.lin2ulaw(pcm_8k, 2)
@@ -233,7 +233,6 @@ async def websocket_endpoint(ws: WebSocket):
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
 async def _twilio_stream(ws: WebSocket):
-    """Async generator — yields parsed Twilio messages."""
     while True:
         try:
             raw = await ws.receive_text()
@@ -254,30 +253,12 @@ def _make_booking_tool() -> types.Tool:
                 parameters=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        "callerName": types.Schema(
-                            type=types.Type.STRING,
-                            description="Full name of the caller",
-                        ),
-                        "callerEmail": types.Schema(
-                            type=types.Type.STRING,
-                            description="Email address of the caller",
-                        ),
-                        "date": types.Schema(
-                            type=types.Type.STRING,
-                            description="Date in YYYY-MM-DD format",
-                        ),
-                        "time": types.Schema(
-                            type=types.Type.STRING,
-                            description="Time in HH:MM 24-hour format",
-                        ),
-                        "reason": types.Schema(
-                            type=types.Type.STRING,
-                            description="Reason for the appointment",
-                        ),
-                        "durationMinutes": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Duration in minutes, default 60",
-                        ),
+                        "callerName":      types.Schema(type=types.Type.STRING, description="Full name of the caller"),
+                        "callerEmail":     types.Schema(type=types.Type.STRING, description="Email address of the caller"),
+                        "date":            types.Schema(type=types.Type.STRING, description="Date in YYYY-MM-DD format"),
+                        "time":            types.Schema(type=types.Type.STRING, description="Time in HH:MM 24-hour format"),
+                        "reason":          types.Schema(type=types.Type.STRING, description="Reason for the appointment"),
+                        "durationMinutes": types.Schema(type=types.Type.INTEGER, description="Duration in minutes, default 60"),
                     },
                     required=["callerName", "callerEmail", "date", "time", "reason"],
                 ),
@@ -286,9 +267,7 @@ def _make_booking_tool() -> types.Tool:
     )
 
 
-async def lookup_client(
-    caller_phone: str, called_number: str, call_sid: str
-) -> Optional[dict]:
+async def lookup_client(caller_phone: str, called_number: str, call_sid: str) -> Optional[dict]:
     payload = {
         "callerPhone":  caller_phone,
         "calledNumber": called_number,
@@ -302,9 +281,7 @@ async def lookup_client(
                 data = resp.json()
                 if data.get("success"):
                     return data
-                log.warning(f"Flow A returned success=false: {data}")
-            else:
-                log.warning("Flow A returned empty or non-200 response")
+                log.warning(f"Flow A success=false: {data}")
     except Exception:
         log.exception("lookup_client error")
     return None
