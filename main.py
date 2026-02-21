@@ -9,17 +9,15 @@ import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# New official Google GenAI SDK (2026)
-from google import genai
-from google.genai import types
+# Google Generative AI (old SDK - works for now)
+import google.generativeai as genai
+from google.generativeai.types import Blob
 
-# TTS fallback (no pydub needed)
+# TTS fallback
 from gtts import gTTS
 
-try:
-    import audioop
-except ImportError:
-    import audioop_lts as audioop
+# Use built-in audioop (no lts needed)
+import audioop
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("receptionist")
@@ -30,7 +28,6 @@ print("Routes registered:")
 for route in app.routes:
     print(f"  {route.path} {route.methods}")
 
-# Configure new SDK
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -41,7 +38,7 @@ N8N_CALL_START_URL = os.environ.get("N8N_CALL_START_URL")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 
-GEMINI_MODEL = "gemini-1.5-flash"  # stable model - use 2.0-flash-exp only if needed
+GEMINI_MODEL = "gemini-1.5-flash"  # stable model
 
 session_store: dict[str, dict] = {}
 
@@ -65,7 +62,7 @@ async def incoming_call(request: Request):
         client_config = await lookup_client(caller_phone, called_number, call_sid)
 
         if not client_config:
-            log.warning("No client config from n8n - returning fallback TwiML")
+            log.warning("No client config - returning fallback TwiML")
             return HTMLResponse(
                 content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Connection error. Please try again later.</Say><Hangup/></Response>',
                 media_type="text/xml",
@@ -79,8 +76,7 @@ async def incoming_call(request: Request):
             "timezone": client_config.get("timezone", "UTC"),
             "systemPrompt": client_config.get("systemPrompt", "You are a helpful AI receptionist."),
             "clientRecordId": client_config.get("clientRecordId", ""),
-            "appointmentBooked": False,
-            "conversation_history": []  # for chat state
+            "appointmentBooked": False
         }
 
         ws_host = os.environ.get("WEBSOCKET_HOST", request.headers.get("host", "localhost"))
@@ -160,17 +156,12 @@ async def websocket_endpoint(ws: WebSocket):
                             log.info("Received media packet from caller")
                             payload = base64.b64decode(message["media"]["payload"])
                             pcm_8k = audioop.ulaw2lin(payload, 2)
-                            # Placeholder STT - replace with real STT later
-                            user_input = "User spoke something"
-                            session["conversation_history"].append({"role": "user", "parts": [user_input]})
-
-                            response = chat.send_message(user_input)
+                            pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
+                            # Send to Gemini (audio input)
+                            response = chat.send_message(Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
                             reply_text = response.text
-
                             await send_text_as_audio(ws, stream_sid, reply_text)
                             log.info(f"Replied with: {reply_text}")
-
-                            session["conversation_history"].append({"role": "model", "parts": [reply_text]})
                         elif message.get("event") == "stop":
                             break
                 except Exception as e:
@@ -194,11 +185,9 @@ async def send_text_as_audio(ws: WebSocket, stream_sid: str, text: str):
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
 
-        # Convert MP3 to raw PCM (no pydub needed - use wave or simple conversion)
-        # Simplified: assume 16kHz mono for now - adjust as needed
-        # For full conversion, add ffmpeg if needed in Railway
-
-        # Placeholder: send silence or minimal packet to keep alive
+        # Convert MP3 to PCM (simple, no pydub needed for basic case)
+        # For full accuracy, add ffmpeg later if needed
+        # Here we use a simple silence placeholder to keep the call alive
         silence = base64.b64encode(b"\x00" * 1600).decode("utf-8")  # 100ms silence
         await ws.send_text(json.dumps({
             "event": "media",
@@ -209,7 +198,22 @@ async def send_text_as_audio(ws: WebSocket, stream_sid: str, text: str):
     except Exception as e:
         log.error(f"TTS send error: {e}")
 
-# Rest of your helper functions remain the same (lookup_client, handle_booking, trigger_post_call, _websocket_stream)
+async def lookup_client(from_number, to_number, sid):
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(N8N_CALL_START_URL, json={
+                "callerPhone": from_number,
+                "calledNumber": to_number,
+                "callSid": sid
+            })
+            log.info(f"n8n status: {resp.status_code}")
+            log.debug(f"n8n body: {resp.text[:500]}")
+            return resp.json() if resp.status_code == 200 else None
+    except Exception as e:
+        log.error(f"lookup_client error: {e}")
+        return None
+
+# Rest of helpers (handle_booking, trigger_post_call, _websocket_stream) unchanged
 
 if __name__ == "__main__":
     import uvicorn
