@@ -1,20 +1,12 @@
-import asyncio
-import base64
 import json
 import logging
 import os
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse
 
-from google import genai
-from google.genai import types
-
-try:
-    import audioop
-except ImportError:
-    import audioop_lts as audioop
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("receptionist")
@@ -25,13 +17,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 N8N_CALL_START_URL = os.environ.get("N8N_CALL_START_URL")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
-WEBSOCKET_HOST = os.environ.get("WEBSOCKET_HOST", "")
 
-GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
+genai.configure(api_key=GEMINI_API_KEY)
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
-session_store: dict = {}
+# In-memory conversation store per call
+# Stores: system_prompt, history, company data
+call_store: dict = {}
 
 
 # ──────────────────────────────────────────────
@@ -44,6 +35,7 @@ async def health():
 
 # ──────────────────────────────────────────────
 # STEP 1 — Twilio calls this when phone rings
+# Returns TwiML that greets the caller and starts listening
 # ──────────────────────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
@@ -54,237 +46,242 @@ async def incoming_call(request: Request):
         call_sid = form.get("CallSid", "")
         log.info(f"Incoming call | from={caller_phone} to={called_number} sid={call_sid}")
 
+        # Look up which business this number belongs to
         client_config = await lookup_client(caller_phone, called_number, call_sid)
 
         if not client_config:
             log.warning(f"No client config for {called_number}")
-            return HTMLResponse(
-                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, this number is not configured. Goodbye.</Say><Hangup/></Response>',
-                media_type="text/xml",
+            return twiml_response(
+                "<Say>Sorry, this number is not configured. Goodbye.</Say><Hangup/>"
             )
 
-        session_store[call_sid] = {
+        company_name = client_config.get("companyName", "our business")
+        system_prompt = client_config.get("systemPrompt", "You are a helpful receptionist.")
+
+        # Store session data for this call
+        call_store[call_sid] = {
             "callerPhone": caller_phone,
             "calledNumber": called_number,
-            "companyName": client_config.get("companyName", "Our Business"),
+            "companyName": company_name,
             "calendarId": client_config.get("calendarId", ""),
             "timezone": client_config.get("timezone", "UTC"),
-            "systemPrompt": client_config.get("systemPrompt", "You are a helpful AI receptionist."),
+            "systemPrompt": system_prompt,
             "clientRecordId": client_config.get("clientRecordId", ""),
+            "history": [],
             "appointmentBooked": False,
             "callerName": "",
             "callerEmail": "",
             "appointmentTime": "",
             "reason": "",
-            "callSummary": "",
         }
 
-        ws_host = WEBSOCKET_HOST or request.headers.get("host", "localhost")
-        log.info(f"TwiML sent | wss://{ws_host}/ws | sid={call_sid}")
-
-        twiml = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            "<Response><Connect>"
-            '<Stream url="wss://' + ws_host + '/ws">'
-            '<Parameter name="callSid" value="' + call_sid + '"/>'
-            "</Stream></Connect></Response>"
+        # Generate greeting using Gemini
+        greeting = await ask_gemini(
+            call_sid,
+            f"Greet the caller warmly as the receptionist for {company_name}. Be friendly and ask how you can help. Keep it brief — 1-2 sentences.",
         )
-        return HTMLResponse(content=twiml, media_type="text/xml")
+
+        log.info(f"Greeting: {greeting}")
+
+        # Return TwiML: say the greeting, then listen for caller's response
+        host = request.headers.get("host", "")
+        gather_url = f"https://{host}/gather"
+
+        return twiml_response(
+            f'<Say voice="Polly.Joanna">{escape_xml(greeting)}</Say>'
+            f'<Gather input="speech" action="{gather_url}" method="POST" '
+            f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+            f'<Say voice="Polly.Joanna">I\'m listening.</Say>'
+            f"</Gather>"
+            f'<Say voice="Polly.Joanna">I didn\'t catch that. Please call back and try again.</Say>'
+            f"<Hangup/>"
+        )
 
     except Exception:
         log.exception("CRASH in /incoming-call")
-        return HTMLResponse(
-            content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, something went wrong. Please try again later.</Say><Hangup/></Response>',
-            media_type="text/xml",
-            status_code=500,
-        )
+        return twiml_response("<Say>Sorry, something went wrong. Please try again.</Say><Hangup/>")
 
 
 # ──────────────────────────────────────────────
-# STEP 2 — WebSocket bridges Twilio ↔ Gemini
+# STEP 2 — Twilio sends the caller's speech here
+# Gemini processes it and we respond with more TwiML
 # ──────────────────────────────────────────────
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    log.info("WebSocket accepted")
-
-    call_sid = None
-    stream_sid = None
-
+@app.post("/gather")
+async def gather(request: Request):
     try:
-        while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            event = msg.get("event")
-            log.info(f"WS event: {event}")
+        form = await request.form()
+        call_sid = form.get("CallSid", "")
+        speech_result = form.get("SpeechResult", "").strip()
+        confidence = form.get("Confidence", "0")
 
-            if event == "connected":
-                continue
-            if event == "start":
-                call_sid = msg["start"]["customParameters"]["callSid"]
-                stream_sid = msg["start"]["streamSid"]
-                log.info(f"Stream started | sid={call_sid} | stream={stream_sid}")
-                break
-            if event == "stop":
-                return
+        log.info(f"Speech | sid={call_sid} | text='{speech_result}' | confidence={confidence}")
 
-        data = session_store.get(call_sid, {})
-        if not data:
-            log.error(f"No session data for {call_sid}")
-            return
-
-        system_prompt = data.get("systemPrompt", "You are a helpful receptionist.")
-        company_name = data.get("companyName", "our business")
-
-        gemini_config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=system_prompt,
-            tools=[_get_tools_config()],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Aoede"
-                    )
-                )
-            ),
-        )
-
-        async with gemini_client.aio.live.connect(
-            model=GEMINI_MODEL, config=gemini_config
-        ) as gemini_session:
-
-            log.info(f"Gemini session open | sid={call_sid}")
-
-            # Send greeting text to kick off the conversation
-            greeting = (
-                "Greet the caller warmly as the receptionist for "
-                + company_name
-                + ". Be friendly and ask how you can help."
-            )
-            await gemini_session.send(input=greeting, end_of_turn=True)
-            log.info(f"Greeting sent | sid={call_sid}")
-
-            await asyncio.gather(
-                _twilio_to_gemini(ws, gemini_session, call_sid),
-                _gemini_to_twilio(gemini_session, ws, stream_sid, call_sid, data),
+        if not speech_result:
+            return twiml_response(
+                '<Say voice="Polly.Joanna">Sorry, I didn\'t catch that. Could you say that again?</Say>'
+                f'<Gather input="speech" action="https://{request.headers.get("host")}/gather" '
+                f'method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+                f"</Gather>"
+                "<Hangup/>"
             )
 
-    except Exception:
-        log.exception(f"WebSocket error | sid={call_sid}")
+        session = call_store.get(call_sid)
+        if not session:
+            return twiml_response(
+                "<Say>Sorry, your session expired. Please call back.</Say><Hangup/>"
+            )
 
-    finally:
-        if call_sid:
+        # Check if caller wants to end the call
+        lower = speech_result.lower()
+        if any(word in lower for word in ["goodbye", "bye", "hang up", "end call", "that's all", "thank you goodbye"]):
+            farewell = await ask_gemini(call_sid, speech_result)
             await trigger_post_call(call_sid)
-        log.info(f"Connection closed | sid={call_sid}")
+            return twiml_response(
+                f'<Say voice="Polly.Joanna">{escape_xml(farewell)}</Say><Hangup/>'
+            )
 
+        # Check if this is a booking request — let Gemini decide
+        gemini_reply = await ask_gemini(call_sid, speech_result)
 
-# ──────────────────────────────────────────────
-# DIRECTION 1 — Caller audio: Twilio → Gemini
-# Uses LiveClientRealtimeInput — the correct wrapper
-# for streaming audio that triggers Gemini's built-in VAD
-# ──────────────────────────────────────────────
-async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
-    media_count = 0
-    try:
-        while True:
-            raw = await ws.receive_text()
-            msg = json.loads(raw)
-            event = msg.get("event")
+        # Check if Gemini wants to book an appointment
+        # (Gemini will include a special marker if booking is needed)
+        if "[[BOOK_APPOINTMENT:" in gemini_reply:
+            booking_result = await process_booking(call_sid, gemini_reply, request)
+            return booking_result
 
-            if event == "media":
-                audio_bytes = base64.b64decode(msg["media"]["payload"])
+        log.info(f"Gemini reply: {gemini_reply}")
 
-                # mulaw 8kHz → linear PCM 16-bit
-                pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
+        host = request.headers.get("host", "")
+        gather_url = f"https://{host}/gather"
 
-                # Boost volume x4 so Gemini VAD can detect speech
-                pcm_8k = audioop.mul(pcm_8k, 2, 4)
-
-                # 8kHz → 16kHz
-                pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
-
-                # LiveClientRealtimeInput is the correct type for streaming
-                # audio that triggers Gemini's native voice activity detection
-                await gemini_session.send(
-                    input=types.LiveClientRealtimeInput(
-                        media_chunks=[
-                            types.Blob(
-                                data=pcm_16k,
-                                mime_type="audio/pcm;rate=16000",
-                            )
-                        ]
-                    )
-                )
-
-                media_count += 1
-                if media_count % 100 == 0:
-                    rms = audioop.rms(pcm_8k, 2)
-                    log.info(f"Sent {media_count} chunks | rms={rms} | sid={call_sid}")
-
-            elif event == "stop":
-                log.info(f"Twilio stop | total={media_count} | sid={call_sid}")
-                break
+        # Speak Gemini's reply and listen for the next caller input
+        return twiml_response(
+            f'<Say voice="Polly.Joanna">{escape_xml(gemini_reply)}</Say>'
+            f'<Gather input="speech" action="{gather_url}" method="POST" '
+            f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+            f"</Gather>"
+            f'<Say voice="Polly.Joanna">Are you still there?</Say>'
+            f'<Gather input="speech" action="{gather_url}" method="POST" '
+            f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+            f"</Gather>"
+            f"<Hangup/>"
+        )
 
     except Exception:
-        log.exception(f"_twilio_to_gemini error | sid={call_sid}")
+        log.exception("CRASH in /gather")
+        return twiml_response(
+            "<Say>Sorry, something went wrong. Please try again.</Say><Hangup/>"
+        )
 
 
 # ──────────────────────────────────────────────
-# DIRECTION 2 — Agent audio: Gemini → Twilio
+# GEMINI — Ask Gemini and maintain conversation history
 # ──────────────────────────────────────────────
-async def _gemini_to_twilio(
-    gemini_session,
-    ws: WebSocket,
-    stream_sid: str,
-    call_sid: str,
-    session_data: dict,
-):
+async def ask_gemini(call_sid: str, user_message: str) -> str:
+    session = call_store.get(call_sid, {})
+    system_prompt = session.get("systemPrompt", "You are a helpful receptionist.")
+    history = session.get("history", [])
+    company_name = session.get("companyName", "our business")
+    calendar_id = session.get("calendarId", "")
+    timezone = session.get("timezone", "UTC")
+
+    # Add booking instruction to system prompt
+    booking_instruction = (
+        "\n\nIMPORTANT: When the caller wants to book an appointment and you have collected their "
+        "name, email, preferred date, time, and reason — respond with ONLY this exact format on the "
+        "last line of your response (after your spoken reply):\n"
+        "[[BOOK_APPOINTMENT:{\"callerName\":\"NAME\",\"callerEmail\":\"EMAIL\","
+        "\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"reason\":\"REASON\",\"durationMinutes\":60}]]\n"
+        f"Calendar ID: {calendar_id}\nTimezone: {timezone}"
+    )
+
+    full_system = system_prompt + booking_instruction
+
     try:
-        async for response in gemini_session.receive():
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=full_system,
+        )
 
-            # Handle appointment booking function calls
-            if response.tool_call:
-                for fc in response.tool_call.function_calls:
-                    if fc.name == "book_appointment":
-                        args = dict(fc.args)
-                        result = await handle_booking(args, call_sid, session_data)
-                        await gemini_session.send(
-                            input=types.LiveClientToolResponse(
-                                function_responses=[
-                                    types.FunctionResponse(
-                                        id=fc.id,
-                                        name=fc.name,
-                                        response=result,
-                                    )
-                                ]
-                            )
-                        )
+        chat = model.start_chat(history=history)
+        response = chat.send_message(user_message)
+        reply = response.text.strip()
 
-            # Send audio back to Twilio
-            if response.data and isinstance(response.data, bytes) and len(response.data) > 0:
-                log.info(f"Audio chunk received | {len(response.data)} bytes | sid={call_sid}")
+        # Update conversation history
+        history.append({"role": "user", "parts": [user_message]})
+        history.append({"role": "model", "parts": [reply]})
+        session["history"] = history
 
-                # PCM 24kHz → 8kHz
-                pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
-
-                # PCM → mulaw for Twilio
-                mulaw = audioop.lin2ulaw(pcm_8k, 2)
-                payload = base64.b64encode(mulaw).decode("utf-8")
-
-                await ws.send_text(
-                    json.dumps({
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": payload},
-                    })
-                )
-
-            # Log when agent finishes speaking
-            if response.server_content and getattr(response.server_content, "turn_complete", False):
-                log.info(f"Agent turn complete | sid={call_sid}")
+        return reply
 
     except Exception:
-        log.exception(f"_gemini_to_twilio error | sid={call_sid}")
+        log.exception(f"ask_gemini error | sid={call_sid}")
+        return "I'm sorry, I had a technical issue. Could you repeat that?"
+
+
+# ──────────────────────────────────────────────
+# BOOKING — Parse Gemini's booking marker and call Flow B
+# ──────────────────────────────────────────────
+async def process_booking(call_sid: str, gemini_reply: str, request: Request) -> HTMLResponse:
+    session = call_store.get(call_sid, {})
+    host = request.headers.get("host", "")
+    gather_url = f"https://{host}/gather"
+
+    try:
+        # Split reply from booking marker
+        parts = gemini_reply.split("[[BOOK_APPOINTMENT:")
+        spoken_part = parts[0].strip()
+        booking_json_str = parts[1].rstrip("]]").strip()
+        booking_data = json.loads(booking_json_str)
+
+        # Add session context
+        booking_data["calendarId"] = session.get("calendarId")
+        booking_data["timezone"] = session.get("timezone")
+        booking_data["companyName"] = session.get("companyName")
+        booking_data["clientRecordId"] = session.get("clientRecordId")
+        booking_data["callerPhone"] = session.get("callerPhone")
+
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.post(N8N_BOOK_APPOINTMENT_URL, json=booking_data)
+        result = resp.json()
+
+        if result.get("success"):
+            session["appointmentBooked"] = True
+            session["appointmentTime"] = booking_data.get("date", "") + " " + booking_data.get("time", "")
+            session["callerName"] = booking_data.get("callerName", "")
+            session["callerEmail"] = booking_data.get("callerEmail", "")
+            session["reason"] = booking_data.get("reason", "")
+
+            confirmation = spoken_part or "Your appointment has been booked! You'll receive a confirmation email shortly."
+            log.info(f"Booking confirmed | sid={call_sid}")
+
+            return twiml_response(
+                f'<Say voice="Polly.Joanna">{escape_xml(confirmation)}</Say>'
+                f'<Gather input="speech" action="{gather_url}" method="POST" '
+                f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+                f"</Gather>"
+                f"<Hangup/>"
+            )
+        else:
+            sorry = "I'm sorry, that time slot isn't available. Would you like to try a different time?"
+            return twiml_response(
+                f'<Say voice="Polly.Joanna">{escape_xml(sorry)}</Say>'
+                f'<Gather input="speech" action="{gather_url}" method="POST" '
+                f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+                f"</Gather>"
+                f"<Hangup/>"
+            )
+
+    except Exception:
+        log.exception(f"process_booking error | sid={call_sid}")
+        sorry = "I had trouble booking that. Could you try again?"
+        return twiml_response(
+            f'<Say voice="Polly.Joanna">{escape_xml(sorry)}</Say>'
+            f'<Gather input="speech" action="{gather_url}" method="POST" '
+            f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+            f"</Gather>"
+            f"<Hangup/>"
+        )
 
 
 # ──────────────────────────────────────────────
@@ -308,12 +305,10 @@ async def lookup_client(caller_phone: str, called_number: str, call_sid: str):
 
         body = resp.text.strip()
         if not body:
-            log.error("Flow A returned empty body")
             return None
 
         data = json.loads(body)
         if not data.get("success"):
-            log.warning(f"Flow A success=false: {data}")
             return None
 
         return data
@@ -324,42 +319,10 @@ async def lookup_client(caller_phone: str, called_number: str, call_sid: str):
 
 
 # ──────────────────────────────────────────────
-# BOOKING — Send to n8n Flow B → Google Calendar
-# ──────────────────────────────────────────────
-async def handle_booking(args: dict, call_sid: str, session_data: dict):
-    try:
-        payload = {
-            **args,
-            "calendarId": session_data.get("calendarId"),
-            "timezone": session_data.get("timezone"),
-            "companyName": session_data.get("companyName"),
-            "clientRecordId": session_data.get("clientRecordId"),
-            "callerPhone": session_data.get("callerPhone"),
-        }
-        async with httpx.AsyncClient(timeout=15) as http:
-            resp = await http.post(N8N_BOOK_APPOINTMENT_URL, json=payload)
-        result = resp.json()
-
-        if result.get("success"):
-            session_data["appointmentBooked"] = True
-            session_data["appointmentTime"] = args.get("date", "") + " " + args.get("time", "")
-            session_data["callerName"] = args.get("callerName", "")
-            session_data["callerEmail"] = args.get("callerEmail", "")
-            session_data["reason"] = args.get("reason", "")
-            log.info(f"Booking confirmed | sid={call_sid}")
-
-        return result
-
-    except Exception:
-        log.exception(f"handle_booking error | sid={call_sid}")
-        return {"success": False, "error": "Booking failed"}
-
-
-# ──────────────────────────────────────────────
 # POST-CALL — Trigger n8n Flow C after hang up
 # ──────────────────────────────────────────────
 async def trigger_post_call(call_sid: str):
-    data = session_store.pop(call_sid, {})
+    data = call_store.pop(call_sid, {})
     if not data:
         return
     try:
@@ -370,7 +333,7 @@ async def trigger_post_call(call_sid: str):
             "companyName": data.get("companyName", ""),
             "appointmentTime": data.get("appointmentTime", ""),
             "reason": data.get("reason", ""),
-            "callSummary": data.get("callSummary", "Call completed."),
+            "callSummary": "Call completed via voice receptionist.",
             "clientTwilioPhone": data.get("calledNumber", ""),
             "clientRecordId": data.get("clientRecordId", ""),
             "appointmentBooked": data.get("appointmentBooked", False),
@@ -378,53 +341,28 @@ async def trigger_post_call(call_sid: str):
         log.info(f"Flow C trigger | sid={call_sid} | booked={payload['appointmentBooked']}")
         async with httpx.AsyncClient(timeout=10) as http:
             resp = await http.post(N8N_POST_CALL_URL, json=payload)
-        log.info(f"Flow C response | {resp.status_code} | {resp.text[:200]}")
-
+        log.info(f"Flow C response | {resp.status_code}")
     except Exception:
         log.exception(f"trigger_post_call error | sid={call_sid}")
 
 
 # ──────────────────────────────────────────────
-# GEMINI TOOLS — Appointment booking definition
+# HELPERS
 # ──────────────────────────────────────────────
-def _get_tools_config():
-    return types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="book_appointment",
-                description="Book an appointment for the caller in Google Calendar",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "callerName": types.Schema(
-                            type=types.Type.STRING,
-                            description="Full name of the caller",
-                        ),
-                        "callerEmail": types.Schema(
-                            type=types.Type.STRING,
-                            description="Email address of the caller for confirmation",
-                        ),
-                        "date": types.Schema(
-                            type=types.Type.STRING,
-                            description="Appointment date in YYYY-MM-DD format",
-                        ),
-                        "time": types.Schema(
-                            type=types.Type.STRING,
-                            description="Appointment time in HH:MM 24-hour format",
-                        ),
-                        "reason": types.Schema(
-                            type=types.Type.STRING,
-                            description="Reason or purpose of the appointment",
-                        ),
-                        "durationMinutes": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Duration in minutes, default is 60",
-                        ),
-                    },
-                    required=["callerName", "callerEmail", "date", "time", "reason"],
-                ),
-            )
-        ]
+def twiml_response(body: str) -> HTMLResponse:
+    return HTMLResponse(
+        content=f'<?xml version="1.0" encoding="UTF-8"?><Response>{body}</Response>',
+        media_type="text/xml",
+    )
+
+
+def escape_xml(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&apos;")
     )
 
 
