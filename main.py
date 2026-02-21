@@ -99,6 +99,7 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         initial_msg = await ws.receive_text()
         msg = json.loads(initial_msg)
+        log.debug(f"Initial WebSocket message: {msg}")
 
         if msg.get("event") == "start":
             stream_sid = msg["start"]["streamSid"]
@@ -106,30 +107,34 @@ async def websocket_endpoint(ws: WebSocket):
             log.info(f"Stream started | sid={call_sid} | stream={stream_sid}")
 
             session = session_store.get(call_sid, {})
+            log.debug(f"Session data: {session}")
 
             config = {
                 "response_modalities": ["AUDIO"],
-                "system_instruction": session.get("systemPrompt", "You are a helpful AI receptionist."),
+                "system_instruction": session.get(
+                    "systemPrompt",
+                    "You are a friendly receptionist named Ava from Sunlight Solar. Always speak clearly and start by greeting the caller."
+                ),
                 "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
-                "tools": [_get_tools_config()],
+                # Temporarily disabled tools to prevent startup issues
+                # "tools": [_get_tools_config()],
             }
 
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
-                # Force initial greeting
-                await gemini_session.send(
-                    input=types.Part.from_text(
-                        "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
-                    )
-                )
-                log.info("Sent initial greeting to Gemini")
+                log.info("Gemini Live session connected")
+
+                # Send initial greeting immediately
+                greeting = "Hi, this is Ava with Sunlight Solar. To get started, are you the home owner?"
+                await gemini_session.send(input=types.Part.from_text(greeting))
+                log.info(f"Sent initial greeting: {greeting}")
 
                 async def twilio_to_gemini():
                     log.info("Starting twilio_to_gemini loop")
                     try:
                         async for message in _websocket_stream(ws):
-                            log.info(f"Received from Twilio: {message.get('event')}")
+                            log.debug(f"Twilio event: {message.get('event')}")
                             if message.get("event") == "media":
-                                log.info("Received media packet from Twilio")
+                                log.info("Received media packet from caller")
                                 payload = base64.b64decode(message["media"]["payload"])
                                 pcm_8k = audioop.ulaw2lin(payload, 2)
                                 pcm_24k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 24000, None)
@@ -138,15 +143,15 @@ async def websocket_endpoint(ws: WebSocket):
                                 log.info("Twilio sent stop event")
                                 break
                     except Exception as e:
-                        log.error(f"Twilio->Gemini error: {e}")
+                        log.error(f"twilio_to_gemini error: {e}")
 
                 async def gemini_to_twilio():
                     log.info("Starting gemini_to_twilio loop")
                     try:
                         async for response in gemini_session.receive():
-                            log.info("Received response from Gemini")
+                            log.debug("Received chunk from Gemini")
                             if response.data:
-                                log.info("Gemini sent audio data")
+                                log.info("Gemini sent audio data - forwarding to Twilio")
                                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
                                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                                 await ws.send_text(json.dumps({
@@ -155,7 +160,7 @@ async def websocket_endpoint(ws: WebSocket):
                                     "media": {"payload": base64.b64encode(mulaw).decode("utf-8")},
                                 }))
                             if response.tool_call:
-                                log.info("Gemini requested tool call")
+                                log.info("Gemini requested tool call - handling")
                                 for fc in response.tool_call.function_calls:
                                     tool_result = await handle_booking(fc.args, call_sid)
                                     await gemini_session.send(input=types.LiveClientToolResponse(
@@ -164,18 +169,21 @@ async def websocket_endpoint(ws: WebSocket):
                                         )]
                                     ))
                     except Exception as e:
-                        log.error(f"Gemini->Twilio error: {e}")
+                        log.error(f"gemini_to_twilio error: {e}")
 
                 await asyncio.gather(twilio_to_gemini(), gemini_to_twilio())
 
     except WebSocketDisconnect:
         log.info(f"WebSocket disconnected | sid={call_sid}")
+    except Exception as e:
+        log.error(f"WebSocket general error: {e}")
     finally:
         if call_sid:
+            log.info("Triggering post-call n8n")
             await trigger_post_call(call_sid)
 
 # ──────────────────────────────────────────────
-# Helper Functions (unchanged)
+# Helper Functions
 # ──────────────────────────────────────────────
 
 async def lookup_client(from_number, to_number, sid):
