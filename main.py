@@ -33,19 +33,10 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 session_store: dict = {}
 
-# Silence detection tuning
-SILENCE_THRESHOLD = 50
-SILENCE_CHUNKS_NEEDED = 25
-SPEECH_THRESHOLD = 80
-```
-
-That's it — just those 3 numbers. Commit the change, wait 2 minutes for Railway, then call again.
-
-After calling you should now see in the logs:
-```
-Speech detected | rms=100 | sid=CA...
-Silence detected — sending end_of_turn
-Audio chunk received | 1920 bytes   ← Gemini responds!
+# Phone audio through Twilio is quiet — keep thresholds low
+SPEECH_THRESHOLD = 80     # RMS above this = caller is speaking
+SILENCE_THRESHOLD = 50    # RMS below this = caller is silent
+SILENCE_CHUNKS_NEEDED = 25  # ~500ms of silence triggers end of turn
 
 
 # ──────────────────────────────────────────────
@@ -163,7 +154,7 @@ async def websocket_endpoint(ws: WebSocket):
             ),
         )
 
-        # Shared flag: True when Gemini is currently speaking
+        # Shared flag so both tasks know if agent is currently speaking
         agent_speaking = asyncio.Event()
 
         async with gemini_client.aio.live.connect(
@@ -196,10 +187,13 @@ async def websocket_endpoint(ws: WebSocket):
 
 # ──────────────────────────────────────────────
 # DIRECTION 1 — Caller audio: Twilio → Gemini
-# Detects speech and silence, sends end_of_turn
-# Interrupts Gemini if caller speaks during response
 # ──────────────────────────────────────────────
-async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_speaking: asyncio.Event):
+async def _twilio_to_gemini(
+    ws: WebSocket,
+    gemini_session,
+    call_sid: str,
+    agent_speaking: asyncio.Event,
+):
     media_count = 0
     silent_chunks = 0
     speaking = False
@@ -213,8 +207,14 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_
 
             if event == "media":
                 audio_bytes = base64.b64decode(msg["media"]["payload"])
+
+                # mulaw 8kHz → linear PCM
                 pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
+
+                # Measure volume
                 rms = audioop.rms(pcm_8k, 2)
+
+                # Upsample 8kHz → 16kHz for Gemini
                 pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
 
                 # Send audio to Gemini
@@ -227,18 +227,9 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_
                 if rms > SPEECH_THRESHOLD:
                     if not speaking:
                         log.info(f"Speech detected | rms={rms} | sid={call_sid}")
-                        # If agent is speaking, send interrupt signal
+                        # Interrupt agent if it is currently speaking
                         if agent_speaking.is_set():
-                            log.info(f"Interrupting agent | sid={call_sid}")
-                            try:
-                                await gemini_session.send(
-                                    input=types.LiveClientRealtimeInput(
-                                        activity_start=types.ActivityStart()
-                                    )
-                                )
-                            except Exception:
-                                # ActivityStart not supported — just send end_of_turn
-                                pass
+                            log.info(f"Caller interrupted agent | sid={call_sid}")
                             agent_speaking.clear()
                     speaking = True
                     silent_chunks = 0
@@ -248,7 +239,7 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_
                     if speaking:
                         silent_chunks += 1
                         if silent_chunks >= SILENCE_CHUNKS_NEEDED and not end_of_turn_sent:
-                            log.info(f"Silence detected — sending end_of_turn | sid={call_sid}")
+                            log.info(f"Silence detected — end_of_turn | sid={call_sid}")
                             await gemini_session.send(input=" ", end_of_turn=True)
                             end_of_turn_sent = True
                             speaking = False
@@ -258,7 +249,7 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_
                     log.info(f"Sent {media_count} chunks | rms={rms} | sid={call_sid}")
 
             elif event == "stop":
-                log.info(f"Twilio stop | total chunks={media_count} | sid={call_sid}")
+                log.info(f"Twilio stop | total={media_count} | sid={call_sid}")
                 break
 
     except Exception:
@@ -267,14 +258,19 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str, agent_
 
 # ──────────────────────────────────────────────
 # DIRECTION 2 — Agent audio: Gemini → Twilio
-# Sets agent_speaking flag while sending audio
 # ──────────────────────────────────────────────
 async def _gemini_to_twilio(
-    gemini_session, ws: WebSocket, stream_sid: str, call_sid: str, session_data: dict, agent_speaking: asyncio.Event
+    gemini_session,
+    ws: WebSocket,
+    stream_sid: str,
+    call_sid: str,
+    session_data: dict,
+    agent_speaking: asyncio.Event,
 ):
     try:
         async for response in gemini_session.receive():
 
+            # Handle appointment booking
             if response.tool_call:
                 for fc in response.tool_call.function_calls:
                     if fc.name == "book_appointment":
@@ -292,11 +288,15 @@ async def _gemini_to_twilio(
                             )
                         )
 
+            # Send audio back to Twilio
             if response.data and isinstance(response.data, bytes) and len(response.data) > 0:
-                agent_speaking.set()  # Mark agent as speaking
+                agent_speaking.set()
                 log.info(f"Audio chunk received | {len(response.data)} bytes | sid={call_sid}")
 
+                # PCM 24kHz → 8kHz
                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
+
+                # PCM → mulaw for Twilio
                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                 payload = base64.b64encode(mulaw).decode("utf-8")
 
@@ -308,11 +308,10 @@ async def _gemini_to_twilio(
                     })
                 )
 
-            # When Gemini finishes its turn, clear the speaking flag
-            if hasattr(response, "server_content") and response.server_content:
-                if getattr(response.server_content, "turn_complete", False):
-                    log.info(f"Agent turn complete | sid={call_sid}")
-                    agent_speaking.clear()
+            # Clear speaking flag when agent finishes its turn
+            if response.server_content and getattr(response.server_content, "turn_complete", False):
+                log.info(f"Agent turn complete | sid={call_sid}")
+                agent_speaking.clear()
 
     except Exception:
         log.exception(f"_gemini_to_twilio error | sid={call_sid}")
