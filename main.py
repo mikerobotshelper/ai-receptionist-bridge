@@ -139,7 +139,7 @@ async def websocket_endpoint(ws: WebSocket):
     speech_config=types.SpeechConfig(
         voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                voice_name="Aoede"
+                voice_name="Kore"
             )
         )
     )
