@@ -133,15 +133,17 @@ async def websocket_endpoint(ws: WebSocket):
         )
 
         gemini_config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=system_prompt,
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Puck"
-                    )
-                )
-            ),
+    response_modalities=["AUDIO"],
+    system_instruction=system_prompt,
+    tools=[_get_tools_config()],
+    speech_config=types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                voice_name="Aoede"
+            )
+        )
+    )
+),
             tools=[make_booking_tool()],
         )
 
