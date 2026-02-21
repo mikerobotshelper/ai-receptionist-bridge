@@ -110,10 +110,9 @@ async def websocket_endpoint(ws: WebSocket):
 
     call_sid = None
     stream_sid = None
-    gemini_session = None
 
     try:
-        # Wait for Twilio "start" event (ignores "connected" event first)
+        # Wait for Twilio "start" event (skip "connected" first)
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
@@ -122,13 +121,11 @@ async def websocket_endpoint(ws: WebSocket):
 
             if event == "connected":
                 continue
-
             if event == "start":
                 call_sid = msg["start"]["customParameters"]["callSid"]
                 stream_sid = msg["start"]["streamSid"]
                 log.info(f"Stream started | sid={call_sid} | stream={stream_sid}")
                 break
-
             if event == "stop":
                 return
 
@@ -140,7 +137,6 @@ async def websocket_endpoint(ws: WebSocket):
         system_prompt = data.get("systemPrompt", "You are a helpful receptionist.")
         company_name = data.get("companyName", "our business")
 
-        # Build Gemini config — AUDIO only, no text/thought output
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_prompt,
@@ -158,7 +154,7 @@ async def websocket_endpoint(ws: WebSocket):
             model=GEMINI_MODEL, config=gemini_config
         ) as gemini_session:
 
-            # Send greeting prompt to kick off the conversation
+            # Send initial greeting prompt to Gemini
             greeting = (
                 "Greet the caller warmly as the receptionist for "
                 + company_name
@@ -167,7 +163,7 @@ async def websocket_endpoint(ws: WebSocket):
             await gemini_session.send(input=greeting, end_of_turn=True)
             log.info("Greeting sent to Gemini")
 
-            # Run both directions concurrently
+            # Run both audio directions simultaneously
             await asyncio.gather(
                 _twilio_to_gemini(ws, gemini_session, call_sid),
                 _gemini_to_twilio(gemini_session, ws, stream_sid, call_sid, data),
@@ -183,7 +179,7 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ──────────────────────────────────────────────
-# DIRECTION 1 — Twilio audio → Gemini
+# DIRECTION 1 — Caller audio: Twilio → Gemini
 # ──────────────────────────────────────────────
 async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
     try:
@@ -193,14 +189,23 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
             event = msg.get("event")
 
             if event == "media":
-                # Twilio sends mulaw 8kHz → convert to PCM 16kHz for Gemini
+                # Decode base64 payload from Twilio
                 audio_bytes = base64.b64decode(msg["media"]["payload"])
+
+                # Twilio sends mulaw 8kHz — convert to linear PCM
                 pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
-                pcm_16k = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)[0]
+
+                # Upsample from 8kHz to 16kHz for Gemini
+                pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
+
+                # Stream caller audio to Gemini
                 await gemini_session.send(
                     input=types.LiveClientRealtimeInput(
                         media_chunks=[
-                            types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000")
+                            types.Blob(
+                                data=pcm_16k,
+                                mime_type="audio/pcm;rate=16000",
+                            )
                         ]
                     )
                 )
@@ -214,13 +219,15 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
 
 
 # ──────────────────────────────────────────────
-# DIRECTION 2 — Gemini audio → Twilio
+# DIRECTION 2 — Agent audio: Gemini → Twilio
 # ──────────────────────────────────────────────
-async def _gemini_to_twilio(gemini_session, ws: WebSocket, stream_sid: str, call_sid: str, session_data: dict):
+async def _gemini_to_twilio(
+    gemini_session, ws: WebSocket, stream_sid: str, call_sid: str, session_data: dict
+):
     try:
         async for response in gemini_session.receive():
 
-            # Handle tool/function calls (appointment booking)
+            # Handle appointment booking function calls
             if response.tool_call:
                 for fc in response.tool_call.function_calls:
                     if fc.name == "book_appointment":
@@ -238,10 +245,12 @@ async def _gemini_to_twilio(gemini_session, ws: WebSocket, stream_sid: str, call
                             )
                         )
 
-            # Handle audio response — convert PCM 24kHz → mulaw 8kHz for Twilio
+            # Send Gemini audio back to Twilio
             if response.data:
-                pcm_24k = response.data
-                pcm_8k = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)[0]
+                # Gemini outputs PCM 24kHz — downsample to 8kHz
+                pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
+
+                # Convert linear PCM to mulaw for Twilio
                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                 payload = base64.b64encode(mulaw).decode("utf-8")
 
@@ -355,7 +364,7 @@ async def trigger_post_call(call_sid: str):
 
 
 # ──────────────────────────────────────────────
-# GEMINI TOOLS — Appointment booking function
+# GEMINI TOOLS — Appointment booking definition
 # ──────────────────────────────────────────────
 def _get_tools_config():
     return types.Tool(
@@ -368,27 +377,27 @@ def _get_tools_config():
                     properties={
                         "callerName": types.Schema(
                             type=types.Type.STRING,
-                            description="Full name of the caller"
+                            description="Full name of the caller",
                         ),
                         "callerEmail": types.Schema(
                             type=types.Type.STRING,
-                            description="Email address of the caller for confirmation"
+                            description="Email address of the caller for confirmation",
                         ),
                         "date": types.Schema(
                             type=types.Type.STRING,
-                            description="Appointment date in YYYY-MM-DD format"
+                            description="Appointment date in YYYY-MM-DD format",
                         ),
                         "time": types.Schema(
                             type=types.Type.STRING,
-                            description="Appointment time in HH:MM 24-hour format"
+                            description="Appointment time in HH:MM 24-hour format",
                         ),
                         "reason": types.Schema(
                             type=types.Type.STRING,
-                            description="Reason or purpose of the appointment"
+                            description="Reason or purpose of the appointment",
                         ),
                         "durationMinutes": types.Schema(
                             type=types.Type.INTEGER,
-                            description="Duration in minutes, default is 60"
+                            description="Duration in minutes, default is 60",
                         ),
                     },
                     required=["callerName", "callerEmail", "date", "time", "reason"],
