@@ -124,7 +124,8 @@ async def websocket_endpoint(ws: WebSocket):
                     "You are Ava, a friendly receptionist for Sunlight Solar. "
                     "Speak immediately and clearly. "
                     "Start every conversation with a greeting and ask if the caller is the homeowner. "
-                    "Do not wait for input before speaking."
+                    "Do not wait for input before speaking. "
+                    "Keep talking if there's silence."
                 ),
                 "speech_config": {"voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}},
             }
@@ -132,34 +133,17 @@ async def websocket_endpoint(ws: WebSocket):
             async with gemini_client.aio.live.connect(model=GEMINI_MODEL, config=config) as gemini_session:
                 log.info("Gemini Live session connected")
 
-                greeting = (
-                    "Hello! This is Ava with Sunlight Solar. "
-                    "I'm excited to help you with solar options. "
-                    "Are you the homeowner? Please say yes or no."
-                )
-                await gemini_session.send(input=types.Part.from_text(greeting))
-                log.info(f"Sent initial greeting: {greeting}")
+                # Send multiple messages to force speech output
+                messages = [
+                    "Hello! This is Ava with Sunlight Solar. I'm excited to help you with solar options. Are you the homeowner? Please say yes or no.",
+                    "I didn't hear a response yet. Are you still there? Please say 'yes' or 'no'.",
+                    "Let's get started. Are you interested in solar panels for your home?"
+                ]
 
-                async def send_follow_up():
-                    await asyncio.sleep(5)
-                    if ws.client_state.CONNECTED:
-                        msg = "I didn't hear a response yet. Are you still there? Please say 'yes' or 'no'."
-                        await gemini_session.send(input=types.Part.from_text(msg))
-                        log.info(f"Sent follow-up: {msg}")
-
-                asyncio.create_task(send_follow_up())
-
-                async def keep_alive():
-                    while ws.client_state.CONNECTED:
-                        await asyncio.sleep(5)
-                        await ws.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": base64.b64encode(b"").decode("utf-8")},
-                        }))
-                        log.debug("Sent keep-alive empty media packet")
-
-                asyncio.create_task(keep_alive())
+                for idx, text in enumerate(messages, 1):
+                    await gemini_session.send(input=types.Part.from_text(text))
+                    log.info(f"Sent message {idx}/{len(messages)}: {text}")
+                    await asyncio.sleep(4)  # give Gemini time to process
 
                 async def twilio_to_gemini():
                     log.info("Starting twilio_to_gemini loop")
@@ -174,7 +158,7 @@ async def websocket_endpoint(ws: WebSocket):
                                 await gemini_session.send(input=types.Blob(data=pcm_24k, mime_type="audio/pcm;rate=24000"))
                                 log.info("Sent caller audio to Gemini")
                             elif message.get("event") == "stop":
-                                log.info("Twilio sent stop event")
+                                log.info("Twilio stop event")
                                 break
                     except Exception as e:
                         log.error(f"twilio_to_gemini error: {e}")
@@ -227,7 +211,7 @@ async def lookup_client(from_number, to_number, sid):
                 "callSid": sid
             })
             log.info(f"n8n status: {resp.status_code}")
-            log.debug(f"n8n body: {resp.text[:500]}")  # truncate if too long
+            log.debug(f"n8n body: {resp.text[:500]}")  # truncate if long
             return resp.json() if resp.status_code == 200 else None
     except Exception as e:
         log.exception(f"lookup_client failed: {e}")
