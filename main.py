@@ -3,10 +3,11 @@ import logging
 import os
 
 import httpx
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("receptionist")
@@ -18,10 +19,9 @@ N8N_CALL_START_URL = os.environ.get("N8N_CALL_START_URL")
 N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 
-genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# In-memory conversation store per call
-# Stores: system_prompt, history, company data
+# In-memory store per call
 call_store: dict = {}
 
 
@@ -35,7 +35,6 @@ async def health():
 
 # ──────────────────────────────────────────────
 # STEP 1 — Twilio calls this when phone rings
-# Returns TwiML that greets the caller and starts listening
 # ──────────────────────────────────────────────
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
@@ -46,19 +45,15 @@ async def incoming_call(request: Request):
         call_sid = form.get("CallSid", "")
         log.info(f"Incoming call | from={caller_phone} to={called_number} sid={call_sid}")
 
-        # Look up which business this number belongs to
         client_config = await lookup_client(caller_phone, called_number, call_sid)
 
         if not client_config:
             log.warning(f"No client config for {called_number}")
-            return twiml_response(
-                "<Say>Sorry, this number is not configured. Goodbye.</Say><Hangup/>"
-            )
+            return twiml_response("<Say>Sorry, this number is not configured. Goodbye.</Say><Hangup/>")
 
         company_name = client_config.get("companyName", "our business")
         system_prompt = client_config.get("systemPrompt", "You are a helpful receptionist.")
 
-        # Store session data for this call
         call_store[call_sid] = {
             "callerPhone": caller_phone,
             "calledNumber": called_number,
@@ -75,15 +70,12 @@ async def incoming_call(request: Request):
             "reason": "",
         }
 
-        # Generate greeting using Gemini
         greeting = await ask_gemini(
             call_sid,
-            f"Greet the caller warmly as the receptionist for {company_name}. Be friendly and ask how you can help. Keep it brief — 1-2 sentences.",
+            f"Greet the caller warmly as the receptionist for {company_name}. Be friendly and ask how you can help. Keep it to 1-2 sentences.",
         )
-
         log.info(f"Greeting: {greeting}")
 
-        # Return TwiML: say the greeting, then listen for caller's response
         host = request.headers.get("host", "")
         gather_url = f"https://{host}/gather"
 
@@ -91,7 +83,6 @@ async def incoming_call(request: Request):
             f'<Say voice="Polly.Joanna">{escape_xml(greeting)}</Say>'
             f'<Gather input="speech" action="{gather_url}" method="POST" '
             f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
-            f'<Say voice="Polly.Joanna">I\'m listening.</Say>'
             f"</Gather>"
             f'<Say voice="Polly.Joanna">I didn\'t catch that. Please call back and try again.</Say>'
             f"<Hangup/>"
@@ -103,8 +94,7 @@ async def incoming_call(request: Request):
 
 
 # ──────────────────────────────────────────────
-# STEP 2 — Twilio sends the caller's speech here
-# Gemini processes it and we respond with more TwiML
+# STEP 2 — Twilio sends caller speech here after each turn
 # ──────────────────────────────────────────────
 @app.post("/gather")
 async def gather(request: Request):
@@ -112,49 +102,40 @@ async def gather(request: Request):
         form = await request.form()
         call_sid = form.get("CallSid", "")
         speech_result = form.get("SpeechResult", "").strip()
-        confidence = form.get("Confidence", "0")
+        log.info(f"Speech | sid={call_sid} | text='{speech_result}'")
 
-        log.info(f"Speech | sid={call_sid} | text='{speech_result}' | confidence={confidence}")
+        host = request.headers.get("host", "")
+        gather_url = f"https://{host}/gather"
 
         if not speech_result:
             return twiml_response(
                 '<Say voice="Polly.Joanna">Sorry, I didn\'t catch that. Could you say that again?</Say>'
-                f'<Gather input="speech" action="https://{request.headers.get("host")}/gather" '
-                f'method="POST" speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
+                f'<Gather input="speech" action="{gather_url}" method="POST" '
+                f'speechTimeout="2" speechModel="phone_call" enhanced="true" timeout="10">'
                 f"</Gather>"
                 "<Hangup/>"
             )
 
         session = call_store.get(call_sid)
         if not session:
-            return twiml_response(
-                "<Say>Sorry, your session expired. Please call back.</Say><Hangup/>"
-            )
+            return twiml_response("<Say>Sorry, your session expired. Please call back.</Say><Hangup/>")
 
         # Check if caller wants to end the call
         lower = speech_result.lower()
-        if any(word in lower for word in ["goodbye", "bye", "hang up", "end call", "that's all", "thank you goodbye"]):
+        if any(w in lower for w in ["goodbye", "bye", "hang up", "that's all", "thank you goodbye"]):
             farewell = await ask_gemini(call_sid, speech_result)
             await trigger_post_call(call_sid)
             return twiml_response(
                 f'<Say voice="Polly.Joanna">{escape_xml(farewell)}</Say><Hangup/>'
             )
 
-        # Check if this is a booking request — let Gemini decide
         gemini_reply = await ask_gemini(call_sid, speech_result)
-
-        # Check if Gemini wants to book an appointment
-        # (Gemini will include a special marker if booking is needed)
-        if "[[BOOK_APPOINTMENT:" in gemini_reply:
-            booking_result = await process_booking(call_sid, gemini_reply, request)
-            return booking_result
-
         log.info(f"Gemini reply: {gemini_reply}")
 
-        host = request.headers.get("host", "")
-        gather_url = f"https://{host}/gather"
+        # Check if Gemini wants to book an appointment
+        if "[[BOOK_APPOINTMENT:" in gemini_reply:
+            return await process_booking(call_sid, gemini_reply, gather_url)
 
-        # Speak Gemini's reply and listen for the next caller input
         return twiml_response(
             f'<Say voice="Polly.Joanna">{escape_xml(gemini_reply)}</Say>'
             f'<Gather input="speech" action="{gather_url}" method="POST" '
@@ -169,45 +150,47 @@ async def gather(request: Request):
 
     except Exception:
         log.exception("CRASH in /gather")
-        return twiml_response(
-            "<Say>Sorry, something went wrong. Please try again.</Say><Hangup/>"
-        )
+        return twiml_response("<Say>Sorry, something went wrong. Please try again.</Say><Hangup/>")
 
 
 # ──────────────────────────────────────────────
-# GEMINI — Ask Gemini and maintain conversation history
+# GEMINI — Text chat with conversation history
 # ──────────────────────────────────────────────
 async def ask_gemini(call_sid: str, user_message: str) -> str:
     session = call_store.get(call_sid, {})
     system_prompt = session.get("systemPrompt", "You are a helpful receptionist.")
     history = session.get("history", [])
-    company_name = session.get("companyName", "our business")
     calendar_id = session.get("calendarId", "")
     timezone = session.get("timezone", "UTC")
 
-    # Add booking instruction to system prompt
     booking_instruction = (
-        "\n\nIMPORTANT: When the caller wants to book an appointment and you have collected their "
-        "name, email, preferred date, time, and reason — respond with ONLY this exact format on the "
-        "last line of your response (after your spoken reply):\n"
-        "[[BOOK_APPOINTMENT:{\"callerName\":\"NAME\",\"callerEmail\":\"EMAIL\","
-        "\"date\":\"YYYY-MM-DD\",\"time\":\"HH:MM\",\"reason\":\"REASON\",\"durationMinutes\":60}]]\n"
+        "\n\nWhen the caller wants to book an appointment and you have their name, email, "
+        "preferred date, time, and reason — include this marker at the very end of your reply "
+        "(after your spoken words):\n"
+        '[[BOOK_APPOINTMENT:{"callerName":"NAME","callerEmail":"EMAIL",'
+        '"date":"YYYY-MM-DD","time":"HH:MM","reason":"REASON","durationMinutes":60}]]\n'
         f"Calendar ID: {calendar_id}\nTimezone: {timezone}"
     )
 
     full_system = system_prompt + booking_instruction
 
-    try:
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=full_system,
-        )
+    # Build messages list for Gemini
+    messages = []
+    for h in history:
+        role = "user" if h["role"] == "user" else "model"
+        messages.append(types.Content(role=role, parts=[types.Part(text=h["parts"][0])]))
 
-        chat = model.start_chat(history=history)
-        response = chat.send_message(user_message)
+    messages.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.0-flash",
+            config=types.GenerateContentConfig(system_instruction=full_system),
+            contents=messages,
+        )
         reply = response.text.strip()
 
-        # Update conversation history
+        # Save to history
         history.append({"role": "user", "parts": [user_message]})
         history.append({"role": "model", "parts": [reply]})
         session["history"] = history
@@ -220,21 +203,17 @@ async def ask_gemini(call_sid: str, user_message: str) -> str:
 
 
 # ──────────────────────────────────────────────
-# BOOKING — Parse Gemini's booking marker and call Flow B
+# BOOKING — Parse Gemini marker and call Flow B
 # ──────────────────────────────────────────────
-async def process_booking(call_sid: str, gemini_reply: str, request: Request) -> HTMLResponse:
+async def process_booking(call_sid: str, gemini_reply: str, gather_url: str) -> HTMLResponse:
     session = call_store.get(call_sid, {})
-    host = request.headers.get("host", "")
-    gather_url = f"https://{host}/gather"
 
     try:
-        # Split reply from booking marker
         parts = gemini_reply.split("[[BOOK_APPOINTMENT:")
         spoken_part = parts[0].strip()
         booking_json_str = parts[1].rstrip("]]").strip()
         booking_data = json.loads(booking_json_str)
 
-        # Add session context
         booking_data["calendarId"] = session.get("calendarId")
         booking_data["timezone"] = session.get("timezone")
         booking_data["companyName"] = session.get("companyName")
@@ -251,10 +230,9 @@ async def process_booking(call_sid: str, gemini_reply: str, request: Request) ->
             session["callerName"] = booking_data.get("callerName", "")
             session["callerEmail"] = booking_data.get("callerEmail", "")
             session["reason"] = booking_data.get("reason", "")
-
-            confirmation = spoken_part or "Your appointment has been booked! You'll receive a confirmation email shortly."
             log.info(f"Booking confirmed | sid={call_sid}")
 
+            confirmation = spoken_part or "Your appointment is confirmed! You'll receive a confirmation email shortly."
             return twiml_response(
                 f'<Say voice="Polly.Joanna">{escape_xml(confirmation)}</Say>'
                 f'<Gather input="speech" action="{gather_url}" method="POST" '
@@ -308,10 +286,7 @@ async def lookup_client(caller_phone: str, called_number: str, call_sid: str):
             return None
 
         data = json.loads(body)
-        if not data.get("success"):
-            return None
-
-        return data
+        return data if data.get("success") else None
 
     except Exception:
         log.exception("lookup_client failed")
