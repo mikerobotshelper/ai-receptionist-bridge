@@ -1,5 +1,4 @@
-fastapi
-uvicorn
-httpx
-google-genai
-gtts
+fastapi>=0.115.0
+uvicorn>=0.30.0
+httpx>=0.27.0
+google-generativeai>=0.8.0
