@@ -4,3 +4,9 @@ httpx
 google-genai
 audioop-lts
 python-multipart
+fastapi
+uvicorn
+httpx
+google-generativeai
+gtts
+pydub  # for audio conversion if needed
