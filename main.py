@@ -27,7 +27,6 @@ N8N_BOOK_APPOINTMENT_URL = os.environ.get("N8N_BOOK_APPOINTMENT_URL")
 N8N_POST_CALL_URL = os.environ.get("N8N_POST_CALL_URL")
 WEBSOCKET_HOST = os.environ.get("WEBSOCKET_HOST", "")
 
-# Confirmed available on your Google AI Studio account
 GEMINI_MODEL = "gemini-2.5-flash-native-audio-latest"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -138,6 +137,8 @@ async def websocket_endpoint(ws: WebSocket):
         system_prompt = data.get("systemPrompt", "You are a helpful receptionist.")
         company_name = data.get("companyName", "our business")
 
+        # VAD tells Gemini when the caller has stopped speaking
+        # Without this, Gemini waits forever and never responds
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_prompt,
@@ -147,6 +148,15 @@ async def websocket_endpoint(ws: WebSocket):
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
                         voice_name="Aoede"
                     )
+                )
+            ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    prefix_padding_ms=200,
+                    silence_duration_ms=500,
                 )
             ),
         )
@@ -183,7 +193,6 @@ async def websocket_endpoint(ws: WebSocket):
 
 # ──────────────────────────────────────────────
 # DIRECTION 1 — Caller audio: Twilio → Gemini
-# Sends raw PCM bytes directly — most compatible method
 # ──────────────────────────────────────────────
 async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
     media_count = 0
@@ -203,17 +212,17 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
                 # 8kHz → 16kHz (Gemini requirement)
                 pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
 
-                # Send directly as bytes with mime_type string — simplest form
+                # Send as dict — simplest form that works
                 await gemini_session.send(
                     input={"data": pcm_16k, "mime_type": "audio/pcm;rate=16000"},
                 )
 
                 media_count += 1
-                if media_count % 50 == 0:
+                if media_count % 100 == 0:
                     log.info(f"Sent {media_count} audio chunks to Gemini | sid={call_sid}")
 
             elif event == "stop":
-                log.info(f"Twilio stop | sid={call_sid} | total chunks sent={media_count}")
+                log.info(f"Twilio stop | sid={call_sid} | total chunks={media_count}")
                 break
 
     except Exception:
@@ -249,8 +258,6 @@ async def _gemini_to_twilio(
 
             # Only process raw audio bytes — skip text/thought parts
             if response.data and isinstance(response.data, bytes) and len(response.data) > 0:
-                log.info(f"Audio chunk received | {len(response.data)} bytes | sid={call_sid}")
-
                 # Gemini outputs PCM 24kHz → downsample to 8kHz for Twilio
                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
 
