@@ -101,7 +101,6 @@ async def websocket_endpoint(ws: WebSocket):
     stream_sid = None
 
     try:
-        # Twilio sends "connected" first then "start" — loop until we see "start"
         while True:
             raw = await ws.receive_text()
             msg = json.loads(raw)
@@ -115,7 +114,6 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 log.info(f"Stream started | sid={call_sid} | stream={stream_sid}")
                 break
-
             elif msg.get("event") == "stop":
                 log.info("Stop before start — closing")
                 return
@@ -127,6 +125,12 @@ async def websocket_endpoint(ws: WebSocket):
         session       = session_store[call_sid]
         system_prompt = session.get("systemPrompt", "You are a helpful receptionist.")
         company_name  = session.get("companyName", "our business")
+
+        greeting = (
+            "Greet the caller warmly as a receptionist for "
+            + company_name
+            + ". Use the name and personality from your system prompt."
+        )
 
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -145,20 +149,15 @@ async def websocket_endpoint(ws: WebSocket):
             model=GEMINI_MODEL, config=gemini_config
         ) as gemini_session:
 
-            await gemini_session.send(
-                input=types.Part.from_text(
-                    "Greet the caller warmly as a receptionist for "
-                    + company_name
-                    + ". Use the name and personality from your system prompt."
-                )
-            )
+            # Send greeting as plain string — not types.Part.from_text()
+            await gemini_session.send(input=greeting, end_of_turn=True)
             log.info("Greeting sent to Gemini")
 
             async def twilio_to_gemini():
                 async for msg in twilio_stream(ws):
                     if msg.get("event") == "media":
-                        mulaw  = base64.b64decode(msg["media"]["payload"])
-                        pcm8   = audioop.ulaw2lin(mulaw, 2)
+                        mulaw    = base64.b64decode(msg["media"]["payload"])
+                        pcm8     = audioop.ulaw2lin(mulaw, 2)
                         pcm16, _ = audioop.ratecv(pcm8, 2, 1, 8000, 16000, None)
                         await gemini_session.send(
                             input=types.Blob(data=pcm16, mime_type="audio/pcm;rate=16000")
