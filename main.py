@@ -138,7 +138,6 @@ async def websocket_endpoint(ws: WebSocket):
         system_prompt = data.get("systemPrompt", "You are a helpful receptionist.")
         company_name = data.get("companyName", "our business")
 
-        # AUDIO only — suppresses text/thought parts that cause the warning
         gemini_config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=system_prompt,
@@ -184,8 +183,10 @@ async def websocket_endpoint(ws: WebSocket):
 
 # ──────────────────────────────────────────────
 # DIRECTION 1 — Caller audio: Twilio → Gemini
+# Sends raw PCM bytes directly — most compatible method
 # ──────────────────────────────────────────────
 async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
+    media_count = 0
     try:
         while True:
             raw = await ws.receive_text()
@@ -193,29 +194,26 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
             event = msg.get("event")
 
             if event == "media":
-                # Decode base64 audio from Twilio (mulaw 8kHz)
+                # Decode base64 mulaw audio from Twilio
                 audio_bytes = base64.b64decode(msg["media"]["payload"])
 
-                # Convert mulaw → linear PCM 16-bit
+                # mulaw 8kHz → linear PCM 16-bit
                 pcm_8k = audioop.ulaw2lin(audio_bytes, 2)
 
-                # Upsample 8kHz → 16kHz for Gemini
+                # 8kHz → 16kHz (Gemini requirement)
                 pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
 
-                # Stream caller audio to Gemini
+                # Send directly as bytes with mime_type string — simplest form
                 await gemini_session.send(
-                    input=types.LiveClientRealtimeInput(
-                        media_chunks=[
-                            types.Blob(
-                                data=pcm_16k,
-                                mime_type="audio/pcm;rate=16000",
-                            )
-                        ]
-                    )
+                    input={"data": pcm_16k, "mime_type": "audio/pcm;rate=16000"},
                 )
 
+                media_count += 1
+                if media_count % 50 == 0:
+                    log.info(f"Sent {media_count} audio chunks to Gemini | sid={call_sid}")
+
             elif event == "stop":
-                log.info(f"Twilio stop | sid={call_sid}")
+                log.info(f"Twilio stop | sid={call_sid} | total chunks sent={media_count}")
                 break
 
     except Exception:
@@ -224,8 +222,6 @@ async def _twilio_to_gemini(ws: WebSocket, gemini_session, call_sid: str):
 
 # ──────────────────────────────────────────────
 # DIRECTION 2 — Agent audio: Gemini → Twilio
-# Only sends response.data (raw audio bytes).
-# Ignores text/thought parts that trigger the warning.
 # ──────────────────────────────────────────────
 async def _gemini_to_twilio(
     gemini_session, ws: WebSocket, stream_sid: str, call_sid: str, session_data: dict
@@ -251,14 +247,14 @@ async def _gemini_to_twilio(
                             )
                         )
 
-            # Only process raw audio bytes — skip text/thought parts entirely
+            # Only process raw audio bytes — skip text/thought parts
             if response.data and isinstance(response.data, bytes) and len(response.data) > 0:
                 log.info(f"Audio chunk received | {len(response.data)} bytes | sid={call_sid}")
 
-                # Gemini outputs PCM 24kHz — downsample to 8kHz for Twilio
+                # Gemini outputs PCM 24kHz → downsample to 8kHz for Twilio
                 pcm_8k, _ = audioop.ratecv(response.data, 2, 1, 24000, 8000, None)
 
-                # Convert linear PCM → mulaw
+                # Linear PCM → mulaw for Twilio
                 mulaw = audioop.lin2ulaw(pcm_8k, 2)
                 payload = base64.b64encode(mulaw).decode("utf-8")
 
