@@ -97,6 +97,11 @@ async def incoming_call(request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    log.info("WebSocket connection attempt received")
+    await ws.accept()
+    log.info("WebSocket accepted")
+    # ... rest of your code
+async def websocket_endpoint(ws: WebSocket):
     """Step 2: The WebSocket bridge between Twilio and Gemini."""
     await ws.accept()
     call_sid = None
