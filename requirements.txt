@@ -1,4 +1,5 @@
 fastapi
 uvicorn
 httpx
-google-generativeai
+google-genai==0.8.0  # latest stable as of Feb 2026
+audioop-lts  # if needed for Python 3.13
